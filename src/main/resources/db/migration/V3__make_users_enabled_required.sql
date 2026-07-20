@@ -1,0 +1,7 @@
+UPDATE users
+SET enabled = TRUE
+WHERE enabled IS NULL;
+
+ALTER TABLE users
+    ALTER COLUMN enabled SET DEFAULT TRUE,
+    ALTER COLUMN enabled SET NOT NULL;
