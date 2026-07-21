@@ -4,7 +4,6 @@ import jakarta.persistence.Column;
 import jakarta.persistence.EntityListeners;
 import jakarta.persistence.MappedSuperclass;
 import lombok.*;
-import org.hibernate.annotations.SQLDelete;
 import org.hibernate.annotations.SQLRestriction;
 import org.springframework.data.annotation.CreatedBy;
 import org.springframework.data.annotation.CreatedDate;
@@ -22,7 +21,7 @@ import java.time.Instant;
 @SQLRestriction("deleted_at IS NULL")
 public class ModifiedEntity {
     @LastModifiedDate
-    @Column(name = "updated_at", insertable = false)
+    @Column(name = "updated_at")
     private Instant updatedAt;
 
     @Column(name = "deleted_at")
@@ -35,7 +34,7 @@ public class ModifiedEntity {
     private Long deletedBy;
 
     @CreatedDate
-    @Column(name = "created_at", updatable = false)
+    @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
     @CreatedBy

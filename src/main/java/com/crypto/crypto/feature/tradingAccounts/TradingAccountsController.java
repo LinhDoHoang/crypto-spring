@@ -21,9 +21,10 @@ public class TradingAccountsController {
     }
 
     @PostMapping
-    public ResponseEntity<ApiResponse<TradingAccountsResponse>> create(@RequestBody CreateTradingAccountsDto createTradingAccountsDto) {
+    public ResponseEntity<ApiResponse<TradingAccountsResponse>> create(@RequestBody @Valid CreateTradingAccountsDto createTradingAccountsDto) {
         TradingAccountsResponse newTradingAccount = this.tradingAccountsService.create(createTradingAccountsDto);
-        return ResponseEntity.ok(ApiResponse.success("Create trading account successfully", newTradingAccount));
+        return ResponseEntity.status(201)
+                .body(ApiResponse.success("Create trading account successfully", newTradingAccount));
     }
 
     @GetMapping
@@ -46,8 +47,8 @@ public class TradingAccountsController {
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<ApiResponse<Void>> delete(@PathVariable("id") @Positive Long id) {
+    public ResponseEntity<Void> delete(@PathVariable("id") @Positive Long id) {
         this.tradingAccountsService.delete(id);
-        return ResponseEntity.ok(ApiResponse.success("Delete tading account " + id + " successfully", null));
+        return ResponseEntity.noContent().build();
     }
 }

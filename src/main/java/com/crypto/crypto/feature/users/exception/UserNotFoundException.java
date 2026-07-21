@@ -1,7 +1,9 @@
 package com.crypto.crypto.feature.users.exception;
 
-public class UserNotFoundException extends RuntimeException {
+import com.crypto.crypto.config.ResourceNotFoundException;
+
+public class UserNotFoundException extends ResourceNotFoundException {
     public UserNotFoundException(Long id) {
-        super("User with id " + id + " was not found");
+        super("User", id);
     }
 }

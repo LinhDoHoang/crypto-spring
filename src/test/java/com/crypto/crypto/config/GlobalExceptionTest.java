@@ -16,7 +16,7 @@ class GlobalExceptionTest {
     @Test
     void userNotFoundReturns404() {
         ResponseEntity<ApiResponse<Void>> response =
-                globalException.handleUserNotFound(new UserNotFoundException(10L));
+                globalException.handleResourceNotFound(new UserNotFoundException(10L));
 
         assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());
         assertNotNull(response.getBody());

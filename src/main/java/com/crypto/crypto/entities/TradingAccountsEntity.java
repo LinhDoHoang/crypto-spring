@@ -7,6 +7,8 @@ import lombok.*;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
+import java.math.BigDecimal;
+
 @Entity
 @Table(name = "trading_accounts")
 @Builder
@@ -23,26 +25,32 @@ public class TradingAccountsEntity extends ModifiedEntity {
     @Column(name = "user_id", nullable = false)
     private Long userId;
 
+    @Builder.Default
     @JdbcTypeCode(SqlTypes.NAMED_ENUM)
     @Enumerated(value = EnumType.STRING)
-    @Column(name = "account_type")
-    private AccountTypeEnum accountType;
+    @Column(name = "account_type", nullable = false, columnDefinition = "account_type_enum")
+    private AccountTypeEnum accountType = AccountTypeEnum.DEMO;
 
-    @Column(name = "currency")
-    private String currency;
+    @Builder.Default
+    @Column(name = "currency", nullable = false)
+    private String currency = "USDT";
 
-    @Column(name = "balance")
-    private Float balance;
+    @Builder.Default
+    @Column(name = "balance", nullable = false, precision = 24, scale = 8)
+    private BigDecimal balance = BigDecimal.ZERO;
 
+    @Builder.Default
     @JdbcTypeCode(SqlTypes.NAMED_ENUM)
     @Enumerated(value = EnumType.STRING)
-    @Column(name = "status")
-    private StatusEnum status;
+    @Column(name = "status", nullable = false, columnDefinition = "status_enum")
+    private StatusEnum status = StatusEnum.ACTIVE;
 
-    @Column(name = "default_leverage")
-    private Integer defaultLeverage;
+    @Builder.Default
+    @Column(name = "default_leverage", nullable = false)
+    private Integer defaultLeverage = 1;
 
-    @Column(name = "version")
+    @Builder.Default
+    @Column(name = "version", nullable = false)
     @Version
-    private Integer version;
+    private Integer version = 0;
 }

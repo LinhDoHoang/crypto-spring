@@ -1,7 +1,9 @@
 package com.crypto.crypto.feature.accountLedgers.exception;
 
-public class AccountLedgerNotfound extends RuntimeException {
+import com.crypto.crypto.config.ResourceNotFoundException;
+
+public class AccountLedgerNotfound extends ResourceNotFoundException {
     public AccountLedgerNotfound(Long id) {
-        super("Account ledger id " + id + " not found!");
+        super("Account ledger", id);
     }
 }

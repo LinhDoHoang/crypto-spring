@@ -1,17 +1,19 @@
 package com.crypto.crypto.feature.users.dto;
 
-import com.crypto.crypto.constant.request.ModifiedDto;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.Size;
 import lombok.Getter;
-import org.hibernate.validator.constraints.Length;
+import lombok.Setter;
 
 @Getter
-public class UpdateUserDto extends ModifiedDto {
-    @Length(min = 8, message = "Min length of email must be greater or equal to 8")
+@Setter
+public class UpdateUserDto {
+    @Email
+    @Size(max = 320)
     private String email;
 
-    @Length(min = 5, message = "Password must be greater than 4 characters")
+    @Size(min = 5, max = 100)
     private String passwordHash;
 
     private Boolean enabled;
-    private Long version;
 }

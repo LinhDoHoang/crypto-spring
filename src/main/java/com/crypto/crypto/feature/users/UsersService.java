@@ -8,7 +8,9 @@ import com.crypto.crypto.feature.users.exception.UserNotFoundException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 
 @Service
 public class UsersService {
@@ -21,7 +23,7 @@ public class UsersService {
     @Transactional
     public UserResponse create(CreateUserDto createUserDto) {
         var builder = UsersEntity.builder()
-                .email(createUserDto.getEmail())
+                .email(normalizeEmail(createUserDto.getEmail()))
                 .passwordHash(createUserDto.getPasswordHash());
 
         if (createUserDto.getEnabled() != null) {
@@ -59,15 +61,11 @@ public class UsersService {
         }
 
         if (updateUserDto.getEmail() != null) {
-            existingUser.setEmail(updateUserDto.getEmail());
+            existingUser.setEmail(normalizeEmail(updateUserDto.getEmail()));
         }
 
         if (updateUserDto.getPasswordHash() != null) {
             existingUser.setPasswordHash(updateUserDto.getPasswordHash());
-        }
-
-        if (updateUserDto.getUpdatedBy() != null) {
-            existingUser.setUpdatedBy(updateUserDto.getUpdatedBy());
         }
 
         return UserResponse.from(existingUser);
@@ -78,7 +76,10 @@ public class UsersService {
         UsersEntity existingUser = usersRepository.findById(id)
                 .orElseThrow(() -> new UserNotFoundException(id));
 
-        usersRepository.softDelete(id);
-        return;
+        existingUser.setDeletedAt(Instant.now());
+    }
+
+    private String normalizeEmail(String email) {
+        return email.trim().toLowerCase(Locale.ROOT);
     }
 }

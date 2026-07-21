@@ -1,33 +1,40 @@
 package com.crypto.crypto.feature.accountLedgers.dto;
 
-import jakarta.persistence.Column;
-import jakarta.validation.constraints.Min;
+import com.crypto.crypto.feature.accountLedgers.constant.LedgerTypeEnum;
+
+import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.Size;
 import lombok.Getter;
 import lombok.Setter;
-import org.hibernate.validator.constraints.Length;
-import org.springframework.validation.annotation.Validated;
 
-@Validated
+import java.math.BigDecimal;
+
 @Getter
 @Setter
 public class CreateAccountLedgerDto {
     @NotNull
-    @Min(1)
+    @Positive
     private Long accountId;
 
-    @Min(1)
+    @Positive
     private Long orderId;
 
-    @Length(max = 30)
-    private String type;
+    @NotNull
+    private LedgerTypeEnum type;
 
-    private Float amount;
+    @NotNull
+    private BigDecimal amount;
 
-    private Float balanceBefore;
+    @NotNull
+    @DecimalMin("0.0")
+    private BigDecimal balanceBefore;
 
-    private Float balanceAfter;
+    @NotNull
+    @DecimalMin("0.0")
+    private BigDecimal balanceAfter;
 
+    @Size(max = 500)
     private String description;
 }

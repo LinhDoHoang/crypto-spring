@@ -1,23 +1,22 @@
 package com.crypto.crypto.feature.users.dto;
 
-import com.crypto.crypto.constant.request.ModifiedDto;
 import jakarta.validation.constraints.Email;
-import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import lombok.Getter;
-import org.hibernate.validator.constraints.Length;
+import lombok.Setter;
 
 @Getter
-public class CreateUserDto extends ModifiedDto {
+@Setter
+public class CreateUserDto {
     @Email
-    @NotNull
-    @Length(min = 8, message = "Min length of email must be greater or equal to 8")
+    @NotBlank
+    @Size(max = 320)
     private String email;
 
-    @NotNull
-    @Length(min = 5, message = "Password must be greater than 4 characters")
+    @NotBlank
+    @Size(min = 5, max = 100)
     private String passwordHash;
 
     private Boolean enabled;
-
-    private Long version;
 }

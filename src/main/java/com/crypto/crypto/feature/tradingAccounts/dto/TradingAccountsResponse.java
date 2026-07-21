@@ -4,12 +4,14 @@ import com.crypto.crypto.entities.TradingAccountsEntity;
 import com.crypto.crypto.feature.tradingAccounts.constant.AccountTypeEnum;
 import com.crypto.crypto.feature.tradingAccounts.constant.StatusEnum;
 
+import java.math.BigDecimal;
+
 public record TradingAccountsResponse(
         Long id,
         Long userId,
         AccountTypeEnum accountType,
         String currency,
-        Float balance,
+        BigDecimal balance,
         StatusEnum status,
         Integer defaultLeverage
 ) {

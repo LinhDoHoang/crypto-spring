@@ -25,7 +25,7 @@ public class UsersController {
     @PostMapping
     public ResponseEntity<ApiResponse<UserResponse>> create(@RequestBody @Valid CreateUserDto createUserDto) {
         UserResponse user = usersService.create(createUserDto);
-        return ResponseEntity.ok(ApiResponse.success("Create user successfully", user));
+        return ResponseEntity.status(201).body(ApiResponse.success("Create user successfully", user));
     }
 
     @GetMapping("/{id}")
@@ -48,8 +48,8 @@ public class UsersController {
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<ApiResponse<Void>> delete(@PathVariable("id") @Positive Long id) {
+    public ResponseEntity<Void> delete(@PathVariable("id") @Positive Long id) {
         this.usersService.delete(id);
-        return ResponseEntity.ok(ApiResponse.success("Delete user successfully", null));
+        return ResponseEntity.noContent().build();
     }
 }

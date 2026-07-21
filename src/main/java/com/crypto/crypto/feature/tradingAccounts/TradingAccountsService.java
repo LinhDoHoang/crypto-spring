@@ -8,6 +8,7 @@ import com.crypto.crypto.feature.tradingAccounts.exception.TradingAccountNotFoun
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.util.List;
 
 @Service
@@ -101,7 +102,6 @@ public class TradingAccountsService {
         TradingAccountsEntity existingTradingAccount = this.tradingAccountRepository.findById(id)
                 .orElseThrow(() -> new TradingAccountNotFound(id));
 
-        this.tradingAccountRepository.softDelete(id);
-        return;
+        existingTradingAccount.setDeletedAt(Instant.now());
     }
 }

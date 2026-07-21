@@ -3,9 +3,9 @@ spring:
     name: crypto
 
   datasource:
-    url: jdbc:postgresql://localhost:5433/crypto
-    username: postgres
-    password: crypto
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/crypto}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:crypto}
     driver-class-name: org.postgresql.Driver
 
   output:
@@ -14,13 +14,13 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: none
-    show-sql: true
+      ddl-auto: validate
+    show-sql: false
     properties:
       hibernate:
         format_sql: true
         jdbc:
-          time_zone: Asia/Ho_Chi_Minh
+          time_zone: UTC
 
   flyway:
     enabled: true
