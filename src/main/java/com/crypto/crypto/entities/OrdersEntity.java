@@ -6,15 +6,7 @@ import com.crypto.crypto.feature.orders.constant.OrderStatusEnum;
 import com.crypto.crypto.feature.orders.constant.OrderTypeEnum;
 import com.crypto.crypto.feature.orders.constant.SizingModeEnum;
 import com.crypto.crypto.feature.orders.constant.SymbolEnum;
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.EnumType;
-import jakarta.persistence.Enumerated;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
-import jakarta.persistence.Version;
+import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -136,4 +128,14 @@ public class OrdersEntity extends ModifiedEntity {
     @Version
     @Column(name = "version", nullable = false)
     private Integer version = 0;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(
+            name = "user_id",
+            referencedColumnName = "id",
+            nullable = false,
+            insertable = false,
+            updatable = false
+    )
+    private UsersEntity user;
 }

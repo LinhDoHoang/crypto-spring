@@ -3,6 +3,8 @@ package com.crypto.crypto.entities;
 import jakarta.persistence.*;
 import lombok.*;
 
+import java.util.List;
+
 @Entity
 @Table(name = "users")
 @Builder
@@ -29,4 +31,10 @@ public class UsersEntity extends ModifiedEntity {
     @Version
     @Column(name = "version", nullable = false)
     private Integer version;
+
+    @OneToOne(mappedBy = "user")
+    private TradingAccountsEntity tradingAccount;
+
+    @OneToMany(mappedBy = "user", fetch = FetchType.LAZY)
+    private List<OrdersEntity> orders;
 }

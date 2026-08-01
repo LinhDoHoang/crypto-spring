@@ -53,4 +53,14 @@ public class TradingAccountsEntity extends ModifiedEntity {
     @Column(name = "version", nullable = false)
     @Version
     private Integer version = 0;
+
+    @OneToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(
+            name = "user_id",
+            referencedColumnName = "id",
+            nullable = false,
+            insertable = false,
+            updatable = false
+    )
+    private UsersEntity user;
 }
