@@ -16,6 +16,8 @@ public class CreateUserDto {
 
     @NotBlank
     @Size(min = 5, max = 100)
+    private String password;
+
     private String passwordHash;
 
     private Boolean enabled;

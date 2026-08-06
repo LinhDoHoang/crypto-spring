@@ -37,4 +37,7 @@ public class UsersEntity extends ModifiedEntity {
 
     @OneToMany(mappedBy = "user", fetch = FetchType.LAZY)
     private List<OrdersEntity> orders;
+
+    @OneToMany(mappedBy = "user", fetch = FetchType.LAZY)
+    private List<RefreshTokensEntity> refreshTokens;
 }

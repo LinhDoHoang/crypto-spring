@@ -1,6 +1,7 @@
 package com.crypto.crypto.config;
 
 import com.crypto.crypto.constant.ApiResponse;
+import com.crypto.crypto.feature.auth.AuthException;
 import jakarta.validation.ConstraintViolationException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -17,6 +18,12 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 @Slf4j
 @RestControllerAdvice
 public class GlobalException {
+    @ExceptionHandler(AuthException.class)
+    public ResponseEntity<ApiResponse<Void>> handleAuthException(AuthException exception) {
+        return ResponseEntity.status(exception.getStatus())
+                .body(ApiResponse.failure(exception.getMessage()));
+    }
+
     @ExceptionHandler(ResourceNotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleResourceNotFound(ResourceNotFoundException exception) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
