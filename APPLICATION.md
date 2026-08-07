@@ -523,6 +523,472 @@ spring:
 
 ---
 
+### 4.11. Entity Relationship Diagram (ERD)
+
+```
+┌──────────────────────┐
+│       users           │
+│──────────────────────│
+│ id (PK, BIGSERIAL)    │
+│ email (VARCHAR 320)   │
+│ password_hash (V100)  │
+│ enabled (BOOLEAN)     │
+│ version (BIGINT)      │
+│ created_at / updated_at│
+│ deleted_at (soft del) │
+└──────┬───────────────┘
+       │
+       │ 1 ───────── 1
+       │ (user_id UNIQUE)
+       ▼
+┌──────────────────────┐
+│  trading_accounts     │
+│──────────────────────│
+│ id (PK, BIGSERIAL)    │
+│ user_id (FK→users)   │
+│ account_type (ENUM)   │
+│ currency (VARCHAR)    │
+│ balance (NUMERIC)     │
+│ status (ENUM)         │
+│ default_leverage      │
+│ version (BIGINT)      │
+│ created_at / updated_at│
+└──────┬───────────────┘
+       │
+       │ 1 ───────── N
+       │ (account_id)
+       ▼
+┌──────────────────────┐         ┌──────────────────────┐
+│       orders          │         │   account_ledgers    │
+│──────────────────────│         │──────────────────────│
+│ id (PK, BIGSERIAL)    │ 1──N   │ id (PK, BIGSERIAL)    │
+│ account_id (FK)       │◄───────│ account_id (FK)       │
+│ user_id (FK→users)   │         │ order_id (nullable)   │
+│ client_order_id       │         │ type (ENUM)           │
+│ symbol (ENUM)         │         │ amount (NUMERIC)      │
+│ side (ENUM)           │         │ balance_before        │
+│ order_type (ENUM)     │         │ balance_after         │
+│ sizing_mode (ENUM)    │         │ description           │
+│ quantity              │         │ created_at / updated_at│
+│ entry_price           │         └──────────────────────┘
+│ entry_mark_timestamp  │
+│ notional              │
+│ leverage              │
+│ initial_margin        │
+│ maintenance_margin_rate│
+│ take_profit / stop_loss│
+│ status (OPEN/CLOSED/  │
+│        LIQUIDATED)    │
+│ close_reason          │
+│ close_price           │
+│ realized_pnl          │
+│ trading_fee           │
+│ client_mark           │
+│ opened_at / closed_at │
+│ version (BIGINT)      │
+└──────────────────────┘
+
+       ┌──────────────────────┐
+       │   refresh_tokens      │
+       │──────────────────────│
+       │ id (PK, UUID)         │
+       │ user_id (FK→users)   │
+       │ token_hash (UNIQUE)   │
+       │ expires_at            │
+       │ revoked_at            │
+       │ device_name / ip / ua │
+       └──────────────────────┘
+
+       ┌──────────────────────┐
+       │       trades          │
+       │  (standalone table,   │
+       │   no FK to entities)  │
+       │──────────────────────│
+       │ id (PK, BIGSERIAL)    │
+       │ time (TIMESTAMPTZ)    │
+       │ asset (ENUM)          │
+       │ price (NUMERIC)       │
+       │ quantity (NUMERIC)    │
+       │ source (ENUM)         │
+       │ source_trade_id       │
+       └──────────────────────┘
+```
+
+### 4.12. Key Database Constraints (Current Implemented)
+
+| Table | Constraint/Index | Purpose |
+|-------|-----------------|---------|
+| `users` | `PK: id` | Primary key |
+| `users` | `UX: lower(email) WHERE deleted_at IS NULL` | Unique active email |
+| `trading_accounts` | `PK: id` | Primary key |
+| `trading_accounts` | `FK: user_id → users.id` | User ownership |
+| `trading_accounts` | `UX: (user_id, account_type) WHERE deleted_at IS NULL` | One account type per user |
+| `trading_accounts` | `CK: balance >= 0` | Non-negative balance |
+| `trading_accounts` | `CK: default_leverage BETWEEN 1 AND 100` | Leverage range |
+| `orders` | `PK: id` | Primary key |
+| `orders` | `FK: user_id → users.id` | User ownership |
+| `orders` | `UX: (account_id, client_order_id) WHERE client_order_id IS NOT NULL` | Idempotency |
+| `orders` | `IX: (account_id, status, opened_at DESC)` | Position listing |
+| `orders` | `IX: (symbol, status)` | Symbol-based queries (TP/SL/liquidation) |
+| `orders` | `CK: quantity > 0` | Positive quantity |
+| `orders` | `CK: entry_price > 0` | Positive entry price |
+| `orders` | `CK: leverage BETWEEN 1 AND 100` | Leverage range |
+| `account_ledgers` | `PK: id` | Primary key |
+| `account_ledgers` | (No FK to orders/accounts in current schema) | Soft reference via `order_id`, `account_id` |
+| `refresh_tokens` | `PK: id` | Primary key |
+| `refresh_tokens` | `FK: user_id → users.id` | User ownership |
+| `refresh_tokens` | `UX: token_hash` | Unique token hash |
+| `trades` | `PK: id` | Primary key |
+| `trades` | `UX: (asset, source_trade_id) WHERE source_trade_id IS NOT NULL` | Deduplication |
+| `trades` | `IX: (asset, time DESC)` | Price queries |
+
+### 4.13. JPA Entity Relationship Mapping Summary
+
+| Parent | Child | Card. | Join Column | JPA Annotation |
+|--------|-------|-------|-------------|----------------|
+| `UsersEntity` | `TradingAccountsEntity` | 1:1 | `user_id` | `@OneToOne(mappedBy="user")` ↔ `@OneToOne @JoinColumn(name="user_id", insertable=false, updatable=false)` |
+| `UsersEntity` | `OrdersEntity` | 1:N | `user_id` | `@OneToMany(mappedBy="user")` ↔ `@ManyToOne @JoinColumn(name="user_id", insertable=false, updatable=false)` |
+| `UsersEntity` | `RefreshTokensEntity` | 1:N | `user_id` | `@OneToMany(mappedBy="user")` ↔ `@ManyToOne @JoinColumn(name="user_id", insertable=false, updatable=false)` |
+| `TradingAccountsEntity` | `OrdersEntity` | 1:N | `account_id` | **No JPA relationship** — referenced via `accountId` field only |
+| `OrdersEntity` | `AccountLedgersEntity` | 1:N | `order_id` | **No JPA relationship** — referenced via `orderId` field only |
+
+> **Note:** `TradingAccountsEntity` and `OrdersEntity` both have `insertable=false, updatable=false` on their `@JoinColumn`. This means the actual FK value is managed via the `userId`/`accountId` Long field, not the entity reference. This is a common pattern to avoid double-write conflicts and keep the FK explicit.
+
+### 4.14. `ModifiedEntity` Base Class
+
+All entities except `RefreshTokensEntity` extend `ModifiedEntity`, which provides via `@MappedSuperclass`:
+
+| Field | Annotation | Purpose |
+|-------|-----------|---------|
+| `createdAt` | `@CreatedDate` | Auto-set on insert |
+| `updatedAt` | `@LastModifiedDate` | Auto-updated on every change |
+| `deletedAt` | (manual) | Soft delete timestamp |
+| `createdBy` | `@CreatedBy` | Audit: who created |
+| `updatedBy` | (manual) | Audit: who last updated |
+| `deletedBy` | (manual) | Audit: who deleted |
+
+Plus `@SQLRestriction("deleted_at IS NULL")` — all queries automatically filter out soft-deleted rows (no need for `WHERE deleted_at IS NULL` in every query).
+
+---
+
+### 4.15. Business Logic Flows — Entity Interactions
+
+#### 4.15.1. Signup Flow
+
+```
+AuthController.signup()
+    │
+    ▼
+AuthService.signup(request, metadata)           ← @Transactional
+    │
+    ├─[1] Validate email + password length
+    ├─[2] Check usersRepository.existsByEmailIgnoreCase(email)
+    │      → 409 CONFLICT if duplicate
+    ├─[3] usersRepository.save(UsersEntity)
+    │      Table: INSERT INTO users (email, password_hash, enabled, version)
+    │      Entity state: id generated, email set, passwordHash=BCrypt, enabled=true
+    │
+    ├─[4] tradingAccountRepository.save(TradingAccountsEntity)
+    │      Table: INSERT INTO trading_accounts (user_id, account_type, currency, balance, status, default_leverage)
+    │      Entity state: userId=user.id, accountType=DEMO, balance=5000, status=ACTIVE, defaultLeverage=1
+    │
+    ├─[5] accountLedgersRepository.save(AccountLedgersEntity)
+    │      Table: INSERT INTO account_ledgers (account_id, type, amount, balance_before, balance_after, description)
+    │      Entity state: accountId=account.id, type=INITIAL_DEPOSIT, amount=5000, balanceBefore=0, balanceAfter=5000
+    │
+    ├─[6] jwtService.issue(user) → access token
+    ├─[7] refreshTokenService.issue(userId, metadata) → refresh token
+    │      Table: INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, device_name, created_by_ip, user_agent)
+    │
+    └─[8] COMMIT (all 3 inserts + refresh token in one transaction)
+           Return: AuthResponseDto + refresh cookie
+```
+
+**Entities involved:** `UsersEntity` → `TradingAccountsEntity` → `AccountLedgersEntity` → `RefreshTokensEntity`
+
+---
+
+#### 4.15.2. Signin Flow
+
+```
+AuthController.signin()
+    │
+    ▼
+AuthService.signin(request, metadata)           ← @Transactional
+    │
+    ├─[1] Normalize email (trim + lowercase)
+    ├─[2] authenticationManager.authenticate(UsernamePasswordAuthenticationToken)
+    │      → DaoAuthenticationProvider
+    │      → AuthUserDetailsService.loadUserByUsername(email)
+    │      → PasswordEncoder.matches(raw, hashed)
+    │      → Throws on bad credentials or disabled account
+    │
+    ├─[3] usersRepository.findByEmailIgnoreCase(email)
+    │      → Verify user exists and is enabled
+    │
+    ├─[4] jwtService.issue(user) → access token
+    ├─[5] refreshTokenService.issue(userId, metadata) → new refresh token
+    │      → Previous refresh tokens are NOT revoked on signin (you stay logged in on other devices)
+    │
+    └─[6] Return: AuthResponseDto + refresh cookie
+```
+
+**Entities involved:** `UsersEntity` → `RefreshTokensEntity`
+
+---
+
+#### 4.15.3. Place Order Flow (Market Order)
+
+```
+OrdersController.create()
+    │
+    ▼
+OrdersService.create(dto)                       ← @Transactional
+    │
+    ├─[1] Validate: symbol, side, sizing mode, quantity/notional, leverage, TP/SL
+    │
+    ├─[2] MarketPriceService.getPrice(symbol) — NOT in transaction
+    │      → Read from Redis price:last:{SYMBOL}
+    │      → Fallback: latest trade from trades table
+    │      → Reject 503 if price unavailable or stale (>5s)
+    │
+    ├─[3] Calculate: notional = quantity * entryPrice
+    │               initialMargin = notional / leverage
+    │               maintenanceMarginRate (from config)
+    │
+    ├─[4] BEGIN TRANSACTION
+    │
+    ├─[5] tradingAccountRepository.findByIdForUpdate(accountId) — PESSIMISTIC_WRITE lock
+    │      → Locks the trading_accounts row to prevent concurrent modifications
+    │
+    ├─[6] Compute account snapshot:
+    │      equity = balance + sum(openOrder.unrealizedPnl)
+    │      usedMargin = sum(openOrder.initialMargin)
+    │      freeMargin = equity - usedMargin
+    │      → Reject 400 if freeMargin < required (initialMargin + estimated fee)
+    │
+    ├─[7] orderRepository.save(OrdersEntity)
+    │      Table: INSERT INTO orders (account_id, user_id, symbol, side, order_type, sizing_mode,
+    │              quantity, entry_price, entry_mark_timestamp, notional, leverage,
+    │              initial_margin, maintenance_margin_rate, take_profit, stop_loss,
+    │              status=OPEN, opened_at, client_order_id, client_mark, max_slippage_bps)
+    │
+    ├─[8] COMMIT
+    │
+    └─[9] (Post-commit) Publish order:placed event
+```
+
+**Entities involved:** `UsersEntity`/`TradingAccountsEntity` (read + lock) → `OrdersEntity` (insert)
+
+---
+
+#### 4.15.4. Close Position Flow (Manual Close)
+
+```
+OrdersController.delete() / POST /orders/{id}/close
+    │
+    ▼
+OrdersService.close(id)                         ← @Transactional
+    │
+    ├─[1] MarketPriceService.getPrice(symbol) — NOT in transaction
+    │      → Reject 503 if price unavailable or stale
+    │
+    ├─[2] BEGIN TRANSACTION
+    │
+    ├─[3] tradingAccountRepository.findByIdForUpdate(accountId) — PESSIMISTIC_WRITE lock
+    │
+    ├─[4] orderRepository.findById(id) — read the order
+    │      → Verify order.accountId matches the locked account
+    │      → Verify order.status == OPEN
+    │      → 404 if not found, 409 if already CLOSED/LIQUIDATED
+    │
+    ├─[5] Calculate PnL:
+    │      BUY:  realizedPnl = (closePrice - entryPrice) * quantity - tradingFee
+    │      SELL: realizedPnl = (entryPrice - closePrice) * quantity - tradingFee
+    │
+    ├─[6] Update order:
+    │      order.status = CLOSED
+    │      order.closeReason = MANUAL
+    │      order.closePrice = serverMark
+    │      order.realizedPnl = calculated
+    │      order.closedAt = now()
+    │      → JPA dirty-checking auto-updates; @Version prevents lost updates
+    │
+    ├─[7] Update trading account:
+    │      balanceBefore = account.balance
+    │      account.balance = balanceBefore + realizedPnl
+    │      → JPA dirty-checking auto-updates
+    │
+    ├─[8] accountLedgersRepository.save(AccountLedgersEntity)
+    │      Table: INSERT INTO account_ledgers (account_id, order_id, type=REALIZED_PNL,
+    │              amount=realizedPnl, balance_before, balance_after)
+    │
+    ├─[9] COMMIT (all 3 changes in one transaction)
+    │
+    └─[10] (Post-commit) Publish order:closed event
+```
+
+**Entities involved:** `TradingAccountsEntity` (lock + update) → `OrdersEntity` (update status + PnL) → `AccountLedgersEntity` (insert)
+
+---
+
+#### 4.15.5. TP/SL Trigger Flow (Automated)
+
+```
+MarketTick received (Binance WebSocket → event)
+    │
+    ▼
+SlTpService.checkTrigger(tick)
+    │
+    ├─[1] Query OPEN orders for this symbol:
+    │      orderRepository.findBySymbolAndStatus(symbol, OPEN)
+    │      → Uses index: ix_orders_symbol_status
+    │
+    ├─[2] For each OPEN order, check trigger conditions:
+    │      BUY  TP: lastPrice >= order.takeProfit
+    │      BUY  SL: lastPrice <= order.stopLoss
+    │      SELL TP: lastPrice <= order.takeProfit
+    │      SELL SL: lastPrice >= order.stopLoss
+    │
+    ├─[3] For each triggered order, execute close:
+    │      Same flow as 4.15.4 but:
+    │      - closeReason = TP or SL
+    │      - Uses conditional UPDATE WHERE status='OPEN' for idempotency
+    │      - Distributed lock lock:close:{orderId} to prevent race with manual close
+    │
+    └─[4] Publish private alert (order:closed with TP/SL reason)
+```
+
+**Entities involved:** `TradesEntity` (trigger source) → `OrdersEntity` (query + update) → `TradingAccountsEntity` (update) → `AccountLedgersEntity` (insert)
+
+---
+
+#### 4.15.6. Liquidation Flow (Automated)
+
+```
+MarketTick received → RiskEngine.evaluate()
+    │
+    ▼
+LiquidationService.checkLiquidation(orders)
+    │
+    ├─[1] For each OPEN order, compute:
+    │      positionEquity = initialMargin + unrealizedPnl
+    │      currentNotional = abs(quantity * markPrice)
+    │      maintenance = currentNotional * maintenanceMarginRate
+    │
+    │      IF positionEquity <= maintenance → LIQUIDATE
+    │
+    ├─[2] BEGIN TRANSACTION
+    │
+    ├─[3] tradingAccountRepository.findByIdForUpdate() — lock account
+    ├─[4] Conditional UPDATE: SET status='LIQUIDATED', close_reason='LIQUIDATION',
+    │      close_price=markPrice, realized_pnl=capped loss, closed_at=now()
+    │      WHERE id = :id AND status = 'OPEN'
+    │
+    ├─[5] Update account balance (cap loss per demo rules)
+    ├─[6] Insert ledger: type=LIQUIDATION
+    ├─[7] COMMIT
+    │
+    └─[8] Publish private liquidation alert
+```
+
+**Entities involved:** `TradesEntity` (trigger source) → `OrdersEntity` (update) → `TradingAccountsEntity` (update) → `AccountLedgersEntity` (insert)
+
+---
+
+#### 4.15.7. Account Snapshot Flow (GET /account)
+
+```
+AccountController.getAccount()
+    │
+    ▼
+AccountService.getSnapshot(userId)
+    │
+    ├─[1] tradingAccountRepository.findByUserId(userId)
+    │      → Get balance from trading_accounts
+    │
+    ├─[2] orderRepository.findByAccountIdAndStatus(accountId, OPEN)
+    │      → Get all open positions
+    │
+    ├─[3] For each open position:
+    │      → MarketPriceService.getPrice(order.symbol)
+    │      → Compute unrealizedPnl per position
+    │
+    ├─[4] Aggregate:
+    │      equity = balance + sum(unrealizedPnl)
+    │      usedMargin = sum(initialMargin)
+    │      freeMargin = equity - usedMargin
+    │      maintenanceMargin = sum(maintenance)
+    │      marginLevel = equity / usedMargin * 100
+    │
+    └─[5] Return snapshot DTO
+```
+
+**Entities involved:** `TradingAccountsEntity` → `OrdersEntity` (open only) → `TradesEntity` (via MarketPriceService for latest price)
+
+---
+
+#### 4.15.8. Refresh Token Rotation Flow
+
+```
+AuthController.refresh(cookie: refresh_token)
+    │
+    ▼
+AuthService.refresh(rawRefreshToken, metadata)
+    │
+    ├─[1] refreshTokenService.rotate(rawToken, metadata)
+    │      → Hash incoming token
+    │      → Find matching refresh_tokens row WHERE token_hash = hash AND revoked_at IS NULL AND expires_at > NOW()
+    │      → REVOKE old token: SET revoked_at = NOW()
+    │      → ISSUE new token: INSERT new row with new hash
+    │      → Return (userId, newTokenValue)
+    │
+    ├─[2] usersRepository.findById(userId) — verify user still enabled
+    │
+    ├─[3] jwtService.issue(user) → new access token
+    │
+    └─[4] Return: AuthResponseDto + new refresh cookie
+```
+
+**Entities involved:** `RefreshTokensEntity` (update old → revoke, insert new) → `UsersEntity` (verify) → JWT (new access token)
+
+---
+
+#### 4.15.9. Summary: Entity Write Matrix
+
+| Operation | users | trading_accounts | orders | account_ledgers | refresh_tokens | trades |
+|-----------|-------|-----------------|--------|-----------------|----------------|--------|
+| Signup | INSERT | INSERT | — | INSERT (INITIAL_DEPOSIT) | INSERT | — |
+| Signin | READ | — | — | — | INSERT | — |
+| Place Order | READ | READ (LOCK) | INSERT (OPEN) | — | — | READ (price) |
+| Close Order | — | UPDATE (balance) | UPDATE (CLOSED) | INSERT (REALIZED_PNL) | — | READ (price) |
+| TP/SL Trigger | — | UPDATE | UPDATE (CLOSED) | INSERT (REALIZED_PNL) | — | READ (price) |
+| Liquidation | — | UPDATE (balance) | UPDATE (LIQUIDATED) | INSERT (LIQUIDATION) | — | READ (price) |
+| Refresh Token | READ | — | — | — | UPDATE(revoke) + INSERT | — |
+| Logout | — | — | — | — | UPDATE (revoke) | — |
+| Account Snapshot | — | READ | READ (OPEN only) | — | — | READ (price) |
+
+### 4.16. Concurrency and Locking Strategy
+
+```
+Place Order:
+  Lock order: account (PESSIMISTIC_WRITE)
+  
+Close Order (Manual/TP/SL/Liquidation):
+  Lock order: account (PESSIMISTIC_WRITE) → order (conditional UPDATE)
+  Safety: conditional UPDATE WHERE status='OPEN' + @Version
+  
+Multiple close attempts:
+  Only ONE wins the conditional update
+  Losers get either "already closed" (409) or "not found" (404)
+  
+TP/SL vs Manual close race:
+  Distributed lock: lock:close:{orderId} (Redis, TTL 3-10s)
+  Database: conditional UPDATE is the final guard
+```
+
+---
+
 ## 5. REST API conventions
 
 ### 5.1. Base URL
