@@ -501,14 +501,25 @@ Các field: id UUID, aggregate_type, aggregate_id, event_type, payload JSONB, cr
 
 ```text
 src/main/resources/db/migration
-├── V1__enable_timescaledb.sql
-├── V2__create_users_and_accounts.sql
-├── V3__create_orders.sql
-├── V4__create_account_ledger.sql
-├── V5__create_trades_hypertable.sql
-├── V6__create_candle_aggregates.sql
-└── V7__create_outbox_events.sql
+├── V1__create_users_table.sql
+├── V2__update_users_table.sql
+├── V3__make_users_enabled_required.sql
+├── V4__make_user_version_default_0.sql
+├── V5__add_created_fields_in_modified_table.sql
+├── V6__create_trading_accounts_table.sql
+├── V7__create_orders_table.sql
+├── V8__create_account_ledger_table.sql
+├── V9__add_modified_fields_to_account_ledgers_table.sql
+├── V10__align_crud_schema_and_orders.sql
+├── V11__create_trades_table.sql
+├── V12__update_entities_relation.sql
+├── V13__unify_entities_relations.sql
+├── V14__create_refresh_tokens_table.sql
+├── V15__unify_entities_relations.sql
+└── V16__add_trading_account_order_relations.sql
 ```
+
+`V15` is intentionally an empty compatibility migration because version 15 was already recorded with checksum `0` in the local database. Do not edit it. The actual `trading_account_id` column and foreign-key constraints are added by `V16`.
 
 Không dùng đồng thời Hibernate auto-create và Flyway:
 

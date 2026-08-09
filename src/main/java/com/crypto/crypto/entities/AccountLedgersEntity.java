@@ -23,7 +23,7 @@ public class AccountLedgersEntity extends ModifiedEntity {
     @Column(name = "account_id", nullable = false)
     private Long accountId;
 
-    @Column(name = "order_id", nullable = false)
+    @Column(name = "order_id")
     private Long orderId;
 
     @Column(name = "type", nullable = false, length = 30)
@@ -42,11 +42,11 @@ public class AccountLedgersEntity extends ModifiedEntity {
     @Column(name = "description", length = 500)
     private String description;
 
-    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(
             name = "order_id",
             referencedColumnName = "id",
-            nullable = false,
+            nullable = true,
             insertable = false,
             updatable = false
     )

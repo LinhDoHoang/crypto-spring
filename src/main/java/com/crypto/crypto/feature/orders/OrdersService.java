@@ -132,6 +132,7 @@ public class OrdersService {
         Instant now = Instant.now();
         OrdersEntity order = OrdersEntity.builder()
                 .accountId(account.getId())
+                .tradingAccountId(account.getId())
                 .userId(user.getId())
                 .clientOrderId(clientOrderId)
                 .symbol(request.getSymbol())
