@@ -148,15 +148,7 @@ public class AuthService {
     public void logout(String rawRefreshToken) {
         refreshTokenService.revoke(rawRefreshToken);
     }
-
-    @Transactional(readOnly = true)
-    public UserResponse me(Long userId) {
-        UsersEntity user = usersRepository.findById(userId)
-                .filter(entity -> Boolean.TRUE.equals(entity.getEnabled()))
-                .orElseThrow(() -> new AuthException(HttpStatus.UNAUTHORIZED, "User is unavailable"));
-        return UserResponse.from(user);
-    }
-
+    
     private AuthResult createSession(
             UsersEntity user,
             RefreshTokenService.TokenMetadata metadata

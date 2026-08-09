@@ -18,24 +18,18 @@ import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
 
 import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
 
 @Configuration
 public class JwtConfig {
     @Bean
-    SecretKey jwtSecretKey(@Value("${app.auth.jwt.secret}") String encodedSecret) {
-        byte[] secret;
-        try {
-            secret = Base64.getDecoder().decode(encodedSecret);
-        } catch (IllegalArgumentException exception) {
-            throw new IllegalStateException("JWT_SECRET must be valid Base64", exception);
-        }
-
-        if (secret.length < 32) {
-            throw new IllegalStateException("JWT_SECRET must decode to at least 32 bytes");
-        }
-
-        return new SecretKeySpec(secret, "HmacSHA256");
+    SecretKey jwtSecretKey(@Value("${app.auth.jwt.secret}") String secret) throws NoSuchAlgorithmException {
+        byte[] key = MessageDigest.getInstance("SHA-256")
+                .digest(secret.getBytes(StandardCharsets.UTF_8));
+        return new SecretKeySpec(key, "HmacSHA256");
     }
 
     @Bean

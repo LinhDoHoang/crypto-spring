@@ -2,6 +2,8 @@ package com.crypto.crypto.config;
 
 import com.crypto.crypto.constant.ApiResponse;
 import com.crypto.crypto.feature.auth.AuthException;
+import com.crypto.crypto.feature.orders.exception.OrderException;
+import com.crypto.crypto.feature.trades.exception.MarketDataException;
 import jakarta.validation.ConstraintViolationException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -20,6 +22,18 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 public class GlobalException {
     @ExceptionHandler(AuthException.class)
     public ResponseEntity<ApiResponse<Void>> handleAuthException(AuthException exception) {
+        return ResponseEntity.status(exception.getStatus())
+                .body(ApiResponse.failure(exception.getMessage()));
+    }
+
+    @ExceptionHandler(OrderException.class)
+    public ResponseEntity<ApiResponse<Void>> handleOrderException(OrderException exception) {
+        return ResponseEntity.status(exception.getStatus())
+                .body(ApiResponse.failure(exception.getMessage()));
+    }
+
+    @ExceptionHandler(MarketDataException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMarketDataException(MarketDataException exception) {
         return ResponseEntity.status(exception.getStatus())
                 .body(ApiResponse.failure(exception.getMessage()));
     }

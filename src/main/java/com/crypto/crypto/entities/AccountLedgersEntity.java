@@ -5,6 +5,7 @@ import jakarta.persistence.*;
 import lombok.*;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 @Entity
 @Table(name = "account_ledgers")
@@ -22,7 +23,7 @@ public class AccountLedgersEntity extends ModifiedEntity {
     @Column(name = "account_id", nullable = false)
     private Long accountId;
 
-    @Column(name = "order_id")
+    @Column(name = "order_id", nullable = false)
     private Long orderId;
 
     @Column(name = "type", nullable = false, length = 30)
@@ -40,4 +41,14 @@ public class AccountLedgersEntity extends ModifiedEntity {
 
     @Column(name = "description", length = 500)
     private String description;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(
+            name = "order_id",
+            referencedColumnName = "id",
+            nullable = false,
+            insertable = false,
+            updatable = false
+    )
+    private OrdersEntity order;
 }

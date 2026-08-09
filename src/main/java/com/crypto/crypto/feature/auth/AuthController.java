@@ -1,6 +1,8 @@
 package com.crypto.crypto.feature.auth;
 
+import com.crypto.crypto.annotation.currentuser.CurrentUser;
 import com.crypto.crypto.constant.ApiResponse;
+import com.crypto.crypto.entities.UsersEntity;
 import com.crypto.crypto.feature.auth.dto.AuthResponseDto;
 import com.crypto.crypto.feature.auth.dto.SigninRequestDto;
 import com.crypto.crypto.feature.auth.dto.SignupRequestDto;
@@ -85,11 +87,10 @@ public class AuthController {
     }
 
     @GetMapping("/me")
-    public ResponseEntity<ApiResponse<UserResponse>> me(@AuthenticationPrincipal Jwt jwt) {
-        Long userId = Long.valueOf(jwt.getSubject());
+    public ResponseEntity<ApiResponse<UserResponse>> me(@CurrentUser UsersEntity user) {
         return ResponseEntity.ok(ApiResponse.success(
                 "Current user found successfully",
-                authService.me(userId)
+                UserResponse.from(user)
         ));
     }
 

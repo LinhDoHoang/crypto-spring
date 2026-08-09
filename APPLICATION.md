@@ -989,6 +989,1389 @@ TP/SL vs Manual close race:
 
 ---
 
+### 4.17. Cách đọc và hiện thực business logic
+
+Phần này mô tả **ý nghĩa nghiệp vụ** phía sau các entity. Khi code, không nên bắt đầu từ việc gọi `repository.save()` ngay. Hãy xác định trước:
+
+1. Request này làm thay đổi entity nào?
+2. Entity nào là nguồn sự thật (source of truth)?
+3. Entity nào cần được lock?
+4. Những thay đổi nào phải commit cùng nhau?
+5. Event chỉ được publish sau khi database commit thành công.
+
+#### 4.17.1. Trách nhiệm của từng layer
+
+```text
+HTTP request
+    │
+    ▼
+Controller
+    │  Parse request, validate DTO, lấy userId từ JWT
+    │  Không tính PnL, không tự sửa balance, không gọi nhiều repository để điều phối
+    ▼
+Application Service
+    │  Điều phối business flow, transaction, authorization, state transition
+    │  Đây là nơi quyết định entity nào được đọc/ghi theo thứ tự nào
+    ▼
+Domain Calculator / Policy
+    │  Tính quantity, margin, PnL, liquidation threshold, slippage
+    │  Không tự commit database
+    ▼
+Repository
+    │  Đọc/ghi entity, query theo ownership, lock row khi cần
+    ▼
+Database
+```
+
+| Layer | Trách nhiệm chính | Không nên làm |
+|---|---|---|
+| Controller | HTTP contract, DTO validation, status code | Chứa trading formula hoặc cập nhật balance |
+| Auth/Order/Account Service | Use case và transaction boundary | Tin `userId`/`accountId` do client gửi |
+| Calculator | Pure calculation, dễ unit test | Gọi repository hoặc Redis |
+| Repository | Persistence, ownership query, pessimistic lock | Chứa business rule |
+| Entity | Trạng thái và dữ liệu domain | Tự gọi service khác |
+| Event publisher | Publish sau commit | Publish khi transaction chưa commit |
+
+#### 4.17.2. Nguồn sự thật của từng loại dữ liệu
+
+```text
+trading_accounts.balance
+    = wallet balance đã realize
+
+orders.status = OPEN
+    = position đang tồn tại và đang sử dụng margin
+
+orders.entry_price + orders.quantity + orders.side
+    = dữ liệu để tính PnL của position
+
+account_ledgers
+    = lịch sử giải thích vì sao balance thay đổi
+
+trades / Redis latest price
+    = dữ liệu giá thị trường, không phải balance hoặc order state
+```
+
+Ý nghĩa quan trọng:
+
+- Không trừ `balance` khi mở position trong mô hình isolated margin hiện tại; `initial_margin` được xem là margin đang sử dụng.
+- Chỉ cập nhật `balance` khi PnL được realize lúc close hoặc liquidation.
+- Không dùng `clientMark` làm giá thực thi. Giá thực thi luôn là server mark.
+- Không xóa order khi close. Chuyển `status` từ `OPEN` sang `CLOSED` hoặc `LIQUIDATED` để giữ lịch sử.
+- Mỗi thay đổi balance phải có một dòng `account_ledgers` tương ứng.
+
+#### 4.17.3. State transition của position
+
+```text
+                    ┌──────────────┐
+                    │  POST order  │
+                    └──────┬───────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │     OPEN     │
+                    └───┬────┬─────┘
+                        │    │
+          manual/TP/SL  │    │  risk threshold reached
+                        │    │
+                        ▼    ▼
+                 ┌────────┐ ┌────────────┐
+                 │ CLOSED │ │ LIQUIDATED │
+                 └────────┘ └────────────┘
+```
+
+Không có đường quay lại `OPEN` trong MVP. Nếu một request cố close order đã `CLOSED` hoặc `LIQUIDATED`, request đó không được tính PnL lần thứ hai.
+
+#### 4.17.4. Signup: tạo đầy đủ aggregate ban đầu
+
+**Ý nghĩa nghiệp vụ:** Một user mới không chỉ là một dòng trong `users`. Để user có thể trade, hệ thống phải tạo đồng thời user, demo account, initial balance ledger và session authentication.
+
+```text
+Signup request
+    │
+    ▼
+Normalize email + validate password
+    │
+    ├── Email đã tồn tại? ── Yes ──> 409, dừng toàn bộ flow
+    │
+    ▼
+INSERT users
+    │  Kết quả cần có: user.id
+    ▼
+INSERT trading_accounts
+    │  user_id = user.id
+    │  balance = 5000 USDT
+    │  status = ACTIVE
+    ▼
+INSERT account_ledgers
+    │  account_id = account.id
+    │  type = INITIAL_DEPOSIT
+    │  before = 0, after = 5000
+    ▼
+Issue access JWT + persist hashed refresh token
+    │
+    ▼
+COMMIT
+    │
+    ▼
+Set refresh cookie + return response
+```
+
+**Transaction boundary:** Từ `INSERT users` đến khi refresh token được lưu phải nằm trong một transaction. Nếu tạo account hoặc ledger thất bại, user cũng không nên được commit riêng lẻ.
+
+**Entity interaction:**
+
+```text
+UsersEntity.id
+    └──> TradingAccountsEntity.userId
+              └──> AccountLedgersEntity.accountId
+UsersEntity.id
+    └──> RefreshTokensEntity.userId
+```
+
+**Code cần viết:** `AuthService.signup()` là application service; `UsersRepository`, `TradingAccountRepository`, `AccountLedgersRepository` và `RefreshTokenService` chỉ hỗ trợ persistence. Controller không được tự tạo bốn entity này.
+
+#### 4.17.5. Signin: xác thực danh tính, không tạo account mới
+
+**Ý nghĩa nghiệp vụ:** Signin chỉ chứng minh email/password hợp lệ và tạo session mới. Không được tạo thêm trading account hoặc reset balance.
+
+```text
+Signin request
+    │
+    ▼
+Normalize email
+    │
+    ▼
+AuthenticationManager
+    │
+    ├── AuthUserDetailsService đọc UsersEntity
+    ├── PasswordEncoder kiểm tra passwordHash
+    └── User disabled/sai password ──> 401/403, dừng flow
+    │
+    ▼
+Load enabled UsersEntity
+    │
+    ▼
+Issue short-lived access JWT
+    │
+    ▼
+Insert refresh token hash vào refresh_tokens
+    │
+    ▼
+Return access token + HttpOnly refresh cookie
+```
+
+`TradingAccountsEntity` không bắt buộc phải đọc trong signin. Account chỉ được đọc ở các flow cần giao dịch hoặc trả account snapshot.
+
+#### 4.17.6. Place order: biến tiền khả dụng thành một position OPEN
+
+**Ý nghĩa nghiệp vụ:** Place order không phải chỉ là insert một order. Hệ thống phải đảm bảo server có giá đáng tin cậy, user sở hữu account, account còn đủ free margin và request không bị xử lý hai lần.
+
+```text
+POST /orders + JWT
+    │
+    ▼
+Extract userId from JWT
+    │
+    ▼
+Find the user's active DEMO account
+    │
+    ▼
+Read server mark
+    │
+    ├── Missing/stale price ──> 503, không mở position
+    ├── Client mark lệch quá giới hạn ──> 409, không mở position
+    └── Giá hợp lệ
+    │
+    ▼
+Validate symbol, side, mode, quantity, leverage, TP/SL
+    │
+    ▼
+Calculate quantity, notional, initial margin
+    │
+    ▼
+BEGIN TRANSACTION
+    │
+    ▼
+Lock TradingAccountsEntity
+    │  Pessimistic write lock để hai request cùng lúc không dùng chung free margin
+    ▼
+Check clientOrderId / Idempotency-Key
+    │
+    ├── Đã tồn tại ──> trả order cũ, không insert order mới
+    └── Chưa tồn tại
+    │
+    ▼
+Read OPEN OrdersEntity + calculate account snapshot
+    │  equity = balance + unrealized PnL
+    │  usedMargin = tổng initial margin của position OPEN
+    │  freeMargin = equity - usedMargin
+    │
+    ├── freeMargin không đủ ──> rollback + 400
+    └── đủ margin
+    │
+    ▼
+INSERT OrdersEntity(status = OPEN)
+    │
+    ▼
+COMMIT
+    │
+    ▼
+Publish order:placed
+```
+
+**Không insert ledger khi chỉ mở order** nếu policy hiện tại không trừ balance lúc mở. Ledger chỉ được tạo khi balance thực sự thay đổi. Nếu sau này muốn tính opening fee và trừ ngay balance, phải thay đổi transaction flow và thêm ledger `TRADING_FEE`.
+
+**Thông tin cần snapshot vào `OrdersEntity`:** entry price, quantity, notional, leverage, initial margin và maintenance margin rate. Không lấy lại các giá trị này từ config khi close vì policy có thể thay đổi sau thời điểm mở.
+
+#### 4.17.7. Manual close: realize PnL đúng một lần
+
+**Ý nghĩa nghiệp vụ:** Close là một state transition nguyên tử. Order đổi trạng thái, account nhận PnL và ledger ghi audit phải thành công hoặc thất bại cùng nhau.
+
+```text
+POST /orders/{id}/close + JWT
+    │
+    ▼
+Extract userId from JWT
+    │
+    ▼
+Load order by id + ownership
+    │
+    ├── Không tồn tại/không thuộc user ──> 404
+    └── Tồn tại
+    │
+    ▼
+Read fresh server mark BEFORE opening DB transaction
+    │
+    ▼
+BEGIN TRANSACTION
+    │
+    ▼
+Lock TradingAccountsEntity
+    │
+    ▼
+Lock/check OrdersEntity
+    │
+    ├── status != OPEN ──> 409, rollback
+    └── status = OPEN
+    │
+    ▼
+Calculate gross PnL and fee
+    │  BUY:  (close - entry) × quantity
+    │  SELL: (entry - close) × quantity
+    │
+    ▼
+Update OrdersEntity
+    │  status = CLOSED
+    │  closeReason = MANUAL
+    │  closePrice = server mark
+    │  realizedPnl = net PnL
+    │  closedAt = now
+    │
+    ▼
+Update TradingAccountsEntity.balance
+    │  balanceAfter = balanceBefore + realizedPnl
+    │
+    ▼
+INSERT AccountLedgersEntity
+    │  type = REALIZED_PNL
+    │  orderId = order.id
+    │  before/after khớp với account balance
+    │
+    ▼
+COMMIT
+    │
+    ▼
+Publish order:closed
+```
+
+**Điểm phải kiểm tra:** `accountId` và `userId` của order phải được đối chiếu với JWT. Không được cho phép client gửi một `accountId` khác để đóng order của user khác.
+
+**Lưu ý về code hiện tại:** `OrdersService` hiện mới có CRUD tổng quát. `OrdersController.delete()` đang soft-delete bằng `deletedAt`, không phải business close. Cần tạo use case riêng như `CloseOrderService.closeManual(...)` hoặc mở rộng `OrdersService` nhưng không dùng `DELETE` để thay thế logic close.
+
+#### 4.17.8. TP/SL: market tick là trigger, close service là nơi realize
+
+**Ý nghĩa nghiệp vụ:** TP/SL không tạo một loại transaction riêng. Nó chỉ là một nguồn kích hoạt khác gọi chung close use case, để manual close, TP và SL dùng cùng cách cập nhật order/account/ledger.
+
+```text
+Binance tick
+    │
+    ▼
+Update latest price cache + persist trade tick
+    │
+    ▼
+Find OPEN orders for tick.symbol
+    │
+    ▼
+Evaluate every order
+    │
+    ├── BUY  TP: price >= takeProfit
+    ├── BUY  SL: price <= stopLoss
+    ├── SELL TP: price <= takeProfit
+    └── SELL SL: price >= stopLoss
+    │
+    ├── Chưa trigger ──> chờ tick tiếp theo
+    └── Đã trigger
+          │
+          ▼
+    Acquire close lock (optional Redis lock)
+          │
+          ▼
+    BEGIN TRANSACTION
+          │
+          ▼
+    Lock account + conditional update order
+          │  WHERE id = ? AND status = OPEN
+          │
+          ├── affected rows = 0 ──> request khác đã close, dừng
+          └── affected rows = 1
+          │
+          ▼
+    Update order + balance + ledger
+          │  closeReason = TP hoặc SL
+          ▼
+    COMMIT
+          │
+          ▼
+    Publish private alert
+```
+
+Không nên viết lại công thức close trong `SlTpService`. `SlTpService` chỉ tìm trigger và gọi `CloseOrderService.close(orderId, reason, mark)`. Nhờ vậy manual close, TP và SL không tạo ba cách tính PnL khác nhau.
+
+#### 4.17.9. Liquidation: bảo vệ account khi position không còn đủ maintenance margin
+
+**Ý nghĩa nghiệp vụ:** Liquidation là close bắt buộc do rủi ro, không phải một lệnh mới từ user. Nó phải dùng server mark và phải kiểm tra lại điều kiện sau khi lock vì giá hoặc state có thể đã thay đổi.
+
+```text
+New market tick
+    │
+    ▼
+Find OPEN orders for symbol
+    │
+    ▼
+Calculate current position risk
+    │  positionEquity = initialMargin + unrealizedPnl
+    │  maintenance = currentNotional × maintenanceMarginRate
+    │
+    ├── positionEquity > maintenance ──> giữ OPEN
+    └── positionEquity <= maintenance
+          │
+          ▼
+    BEGIN TRANSACTION
+          │
+          ▼
+    Lock account, then order
+          │
+          ▼
+    Recalculate using latest mark
+          │
+          ├── Không còn đủ điều kiện ──> rollback, giữ OPEN
+          └── Vẫn đủ điều kiện
+                │
+                ▼
+          Update order(status = LIQUIDATED)
+                │
+                ▼
+          Update account balance theo loss cap policy
+                │
+                ▼
+          Insert ledger(type = LIQUIDATION)
+                │
+                ▼
+          COMMIT + publish private alert
+```
+
+Không được query và liquidation toàn bộ order mà không lọc `symbol`/`status`. Market tick của BTC chỉ nên xử lý các position `OPEN` của BTC.
+
+#### 4.17.10. Account snapshot: dữ liệu đọc tổng hợp, không phải entity riêng
+
+**Ý nghĩa nghiệp vụ:** `TradingAccountsEntity.balance` chỉ là wallet balance. Các giá trị `equity`, `freeMargin`, `usedMargin` và `uPnL` phải được tính từ account + các position OPEN + server mark hiện tại.
+
+```text
+GET /account + JWT
+    │
+    ▼
+Resolve userId from JWT
+    │
+    ▼
+Load active TradingAccountsEntity
+    │
+    ▼
+Load OrdersEntity WHERE accountId = account.id AND status = OPEN
+    │
+    ▼
+Load one current server mark for each symbol
+    │
+    ▼
+Calculate each position uPnL
+    │
+    ▼
+Aggregate snapshot
+    │  balance = account.balance
+    │  equity = balance + total uPnL
+    │  used = total initial margin
+    │  free = equity - used
+    │  maintenance = total maintenance margin
+    │
+    ▼
+Return AccountSnapshot DTO
+```
+
+Nếu một position OPEN không có giá mới, không được âm thầm bỏ qua position đó. Trả lỗi `PRICE_UNAVAILABLE` hoặc đánh dấu response degraded, vì bỏ qua nó sẽ làm `freeMargin` sai và có thể cho phép mở lệnh vượt giới hạn.
+
+#### 4.17.11. Refresh token: session lifecycle độc lập với trading state
+
+**Ý nghĩa nghiệp vụ:** Refresh token chỉ thay thế access token. Nó không thay đổi balance, order hoặc account.
+
+```text
+Refresh cookie
+    │
+    ▼
+Hash raw token
+    │
+    ▼
+Find active RefreshTokensEntity
+    │
+    ├── Không tìm thấy / expired / revoked ──> 401
+    └── Hợp lệ
+          │
+          ▼
+    Revoke old refresh token
+          │
+          ▼
+    Insert new refresh token hash
+          │
+          ▼
+    Load enabled UsersEntity
+          │
+          ▼
+    Issue new access JWT
+          │
+          ▼
+    Set new HttpOnly cookie
+```
+
+Refresh token rotation nên nằm trong transaction riêng. Không dùng raw refresh token làm database key; chỉ lưu hash.
+
+#### 4.17.12. Checklist trước khi code một use case
+
+```text
+[ ] Xác định userId từ JWT, không lấy ownership từ request body
+[ ] Xác định entity đọc và entity thay đổi
+[ ] Xác định state transition hợp lệ
+[ ] Validate input trước transaction nếu không cần lock
+[ ] Lấy market price trước transaction, kiểm tra freshness
+[ ] Lock account trước order nếu flow thay đổi balance
+[ ] Re-check state sau khi lock
+[ ] Tính toán bằng BigDecimal
+[ ] Cập nhật order/account/ledger trong cùng transaction
+[ ] Dùng conditional update hoặc @Version để chống xử lý hai lần
+[ ] Commit xong mới publish event
+[ ] Viết unit test cho calculator và integration test cho transaction
+```
+
+#### 4.17.13. Khoảng trống giữa tài liệu và code hiện tại
+
+Tài liệu này mô tả business target của MVP. Code hiện tại đã có authentication và CRUD cơ bản, nhưng trading flow chưa hoàn chỉnh:
+
+| Business capability | Code hiện tại | Việc cần làm |
+|---|---|---|
+| Signup + initial account + ledger | Đã có trong `AuthService.signup()` | Bổ sung repository locking/constraint tests |
+| Signin + JWT + refresh token | Đã có | Kiểm tra secret, ownership và integration tests |
+| Generic order CRUD | Đã có trong `OrdersService` | Không dùng làm place/close use case cuối cùng |
+| Place market order | Chưa có đầy đủ | Thêm price service, margin calculator, account lock, idempotency |
+| Manual close | Chưa có đúng business flow | Thêm close service, PnL, balance update, ledger |
+| Account snapshot | Chưa có | Thêm snapshot service và query OPEN orders |
+| TP/SL watcher | Chưa có | Thêm market-tick trigger và dùng chung close service |
+| Liquidation | Chưa có | Thêm risk evaluation, recheck sau lock và liquidation ledger |
+| Account/order ownership | CRUD hiện có nhận ID từ DTO | Lấy userId từ JWT và query kèm ownership |
+| Account/order/ledger foreign keys | Một số quan hệ hiện chỉ là `Long` reference | Bổ sung FK migration sau khi kiểm tra dữ liệu hiện tại |
+
+Khi hiện thực, nên ưu tiên theo thứ tự:
+
+```text
+1. MarketPriceService + fake price provider cho test
+2. MarginCalculator + PnL calculator
+3. AccountSnapshotService
+4. PlaceOrderService
+5. CloseOrderService
+6. Ledger consistency tests
+7. TP/SL trigger dùng CloseOrderService
+8. Liquidation dùng cùng close infrastructure
+```
+
+---
+
+### 4.18. Business Execution Specification — Flow có thể chuyển trực tiếp thành code
+
+Phần này cố định các quy tắc MVP để giảm việc phải tự quyết định business khi luyện Java. Mỗi use case được mô tả theo cùng một khuôn:
+
+```text
+Input
+  → Validate
+  → Load data
+  → Read market data nếu cần
+  → Begin transaction
+  → Lock và re-check state
+  → Calculate
+  → Update/insert entities
+  → Commit
+  → Build response và publish event
+```
+
+Không được đổi thứ tự thành `save entity trước rồi mới validate` hoặc `publish event trước commit`.
+
+#### 4.18.1. Quy ước dữ liệu cố định của MVP
+
+##### A. Field client được phép gửi
+
+Với API mở market order, request nghiệp vụ nên chỉ chứa các field sau:
+
+| Field | Required | Server xử lý |
+|---|---:|---|
+| `symbol` | Yes | Normalize và kiểm tra trong `BTCUSDT`, `ETHUSDT`, `SOLUSDT` |
+| `side` | Yes | `BUY` hoặc `SELL` |
+| `mode` | Yes | `UNITS` hoặc `NOTIONAL` |
+| `qtyUnits` | Khi `UNITS` | Dùng để tính quantity |
+| `notionalUsd` | Khi `NOTIONAL` | Dùng để tính quantity |
+| `leverage` | Yes | Kiểm tra 1..100 và giới hạn account/symbol |
+| `tp` | No | Kiểm tra hướng hợp lệ theo side và server mark |
+| `sl` | No | Kiểm tra hướng hợp lệ theo side và server mark |
+| `clientMark` | No | Chỉ kiểm tra slippage và lưu audit |
+| `clientTs` | No | Chỉ lưu audit, không dùng làm execution time |
+| `maxSlippageBps` | No | Default 5, giới hạn 0..100 |
+| `clientOrderId`/`Idempotency-Key` | Recommended | Dùng chống tạo order trùng |
+
+`accountId`, `userId`, `entryPrice`, `quantity`, `notional`, `initialMargin`, `status`, `openedAt` và `tradingFee` không nên được tin từ client. Đây là server-owned fields.
+
+`CreateOrderDto` hiện tại đang chứa cả field input và field đã tính toán. Khi code business service, hãy coi DTO hiện tại là persistence-shaped DTO hoặc tạo một `PlaceOrderRequest` riêng. Client không được gửi giá trị đã tính để ghi thẳng vào `OrdersEntity`.
+
+##### B. Field server tự tạo khi mở order
+
+| Entity field | Giá trị nguồn |
+|---|---|
+| `userId` | JWT `sub` |
+| `accountId` | Active DEMO account của `userId` |
+| `entryPrice` | Fresh server mark |
+| `entryMarkTimestamp` | Timestamp của server mark |
+| `quantity` | Request hoặc `notionalUsd / entryPrice` |
+| `notional` | `quantity.abs() * entryPrice` |
+| `initialMargin` | `notional / leverage` |
+| `maintenanceMarginRate` | Trading configuration tại thời điểm mở |
+| `status` | `OPEN` |
+| `openedAt` | Server `now` |
+| `tradingFee` | `0` trong MVP hiện tại |
+| `version` | Database/JPA quản lý |
+
+##### C. Decimal và rounding
+
+Tất cả calculation dùng `BigDecimal`.
+
+```text
+Price scale:       12 decimal places
+Quantity scale:    12 decimal places
+Money/PnL scale:    8 decimal places
+```
+
+Quy tắc MVP:
+
+1. Parse input bằng `new BigDecimal(String)`, không dùng `new BigDecimal(double)`.
+2. Không `round` giữa các bước calculation nếu chưa cần persist.
+3. Khi persist money/PnL, set scale 8 bằng policy thống nhất, ví dụ `RoundingMode.HALF_UP`.
+4. Khi persist price/quantity, set scale 12.
+5. Không so sánh tiền bằng `==`; dùng `compareTo`.
+6. Không dùng `double`, `float`, `Math.round` cho financial calculation.
+
+##### D. Price freshness
+
+`MarketPriceService` trả về:
+
+```text
+symbol
+price
+timestamp
+source
+```
+
+Một price hợp lệ phải thỏa:
+
+```text
+price > 0
+timestamp != null
+now - timestamp <= maxPriceAge
+```
+
+MVP dùng `maxPriceAge = 5 seconds`. Nếu không thỏa, dừng flow với `503 PRICE_UNAVAILABLE` hoặc `503 PRICE_STALE`.
+
+##### E. Các công thức chung
+
+```text
+notional = abs(quantity) × price
+
+initialMargin = notional / leverage
+
+BUY unrealizedPnl  = (markPrice - entryPrice) × quantity
+SELL unrealizedPnl = (entryPrice - markPrice) × quantity
+
+equity = balance + totalUnrealizedPnl
+usedMargin = sum(initialMargin of OPEN orders)
+freeMargin = equity - usedMargin
+
+maintenanceMargin = currentNotional × maintenanceMarginRate
+currentNotional = abs(quantity) × markPrice
+```
+
+MVP fee rate hiện tại là `0`, nhưng vẫn giữ các field fee để có thể bật sau.
+
+```text
+openingFee = entryNotional × takerFeeRate
+closingFee = closeNotional × takerFeeRate
+grossPnl = side-specific PnL
+netPnl = grossPnl - openingFee - closingFee
+```
+
+Nếu bật opening fee, phải quyết định rõ fee được trừ ngay lúc mở và tạo `TRADING_FEE` ledger, hoặc cộng dồn đến lúc close. Không được chỉ đổi công thức mà bỏ qua ledger.
+
+#### 4.18.2. Signup — đặc tả thực thi đầy đủ
+
+##### Input
+
+```json
+{
+  "email": "user@example.com",
+  "password": "secret123"
+}
+```
+
+##### Validation
+
+Thực hiện theo đúng thứ tự:
+
+1. Request body không được null.
+2. `email` không được null hoặc blank.
+3. `email.trim()` không vượt quá 320 characters.
+4. Email phải có format hợp lệ.
+5. Chuẩn hóa email bằng `trim().toLowerCase(Locale.ROOT)`.
+6. `password` không được null hoặc blank.
+7. Password phải có tối thiểu 6 characters để tương thích frontend MVP.
+8. Password UTF-8 không vượt quá 72 bytes vì BCrypt giới hạn 72 bytes.
+9. `existsByEmailIgnoreCase(normalizedEmail)` phải là false.
+
+Nếu validation thất bại, không insert bất kỳ entity nào.
+
+##### Thứ tự ghi entity
+
+```text
+BEGIN TRANSACTION
+
+1. Hash password bằng PasswordEncoder
+
+2. Tạo UsersEntity:
+   email       = normalizedEmail
+   passwordHash = encodedPassword
+   enabled     = true
+
+3. Save UsersEntity
+   Kết quả bắt buộc: user.id != null
+
+4. Tạo TradingAccountsEntity:
+   userId          = user.id
+   accountType     = DEMO
+   currency        = USDT
+   balance         = 5000.00
+   status          = ACTIVE
+   defaultLeverage = 1
+
+5. Save TradingAccountsEntity
+   Kết quả bắt buộc: account.id != null
+
+6. Tạo AccountLedgersEntity:
+   accountId      = account.id
+   orderId        = null
+   type           = INITIAL_DEPOSIT
+   amount         = 5000.00
+   balanceBefore  = 0.00
+   balanceAfter   = 5000.00
+   description    = Initial demo account deposit
+
+7. Issue access JWT với subject = user.id
+
+8. Generate raw refresh token bằng SecureRandom
+
+9. Hash raw refresh token bằng SHA-256
+
+10. Save RefreshTokensEntity:
+    userId       = user.id
+    tokenHash    = hash(rawToken)
+    createdAt    = now
+    expiresAt    = now + refreshTokenTtl
+    device/ip/ua = metadata từ request
+
+COMMIT
+```
+
+JWT và raw refresh token chỉ được trả sau khi transaction hoàn tất. Database chỉ lưu refresh token hash, không lưu raw token.
+
+##### Kết quả
+
+```text
+HTTP 201
+accessToken = JWT ngắn hạn
+refreshToken = HttpOnly cookie
+user = id, email, enabled
+```
+
+##### Invariant sau signup
+
+```text
+users.id tồn tại
+trading_accounts.user_id = users.id
+trading_accounts.balance = 5000.00
+account_ledgers.account_id = trading_accounts.id
+account_ledgers.balance_before = 0.00
+account_ledgers.balance_after = 5000.00
+```
+
+Nếu một bước fail, toàn bộ user/account/ledger/refresh token phải rollback.
+
+#### 4.18.3. Signin — đặc tả thực thi đầy đủ
+
+##### Validation và authentication
+
+1. Normalize email giống signup.
+2. Password không vượt quá 72 UTF-8 bytes.
+3. Gọi `AuthenticationManager.authenticate(...)`.
+4. `AuthUserDetailsService` load user theo email.
+5. `PasswordEncoder` compare raw password với password hash.
+6. Nếu user không tồn tại hoặc password sai, trả cùng lỗi `401 INVALID_CREDENTIALS`.
+7. Nếu user tồn tại nhưng `enabled = false`, trả `403 ACCOUNT_DISABLED`.
+
+##### Thứ tự thực thi
+
+```text
+1. Authenticate credentials
+2. Load enabled UsersEntity
+3. Issue access JWT:
+   sub = user.id.toString()
+   iss = configured issuer
+   aud = configured audience
+   scope = USER
+   iat = now
+   exp = now + accessTokenTtl
+   jti = random UUID
+4. Generate and hash refresh token
+5. Save RefreshTokensEntity
+6. Set refresh cookie
+7. Return access token and UserResponse
+```
+
+Signin không tạo user mới, không tạo trading account mới và không reset balance.
+
+#### 4.18.4. Place market order — đặc tả thực thi đầy đủ
+
+##### Input nghiệp vụ
+
+```json
+{
+  "symbol": "BTCUSDT",
+  "side": "BUY",
+  "mode": "UNITS",
+  "qtyUnits": 0.01,
+  "notionalUsd": null,
+  "leverage": 10,
+  "tp": 70000.0,
+  "sl": 62000.0,
+  "clientMark": 65000.0,
+  "clientTs": 1784100000123,
+  "maxSlippageBps": 5,
+  "clientOrderId": "client-order-001"
+}
+```
+
+##### Validation trước khi đọc account
+
+1. Lấy `userId` từ JWT `sub`.
+2. Không dùng `userId` hoặc `accountId` từ request để xác định ownership.
+3. `symbol` phải thuộc allowlist.
+4. `side` phải là `BUY` hoặc `SELL`.
+5. `mode` phải là `UNITS` hoặc `NOTIONAL`.
+6. Nếu `mode = UNITS`, `qtyUnits` bắt buộc và `notionalUsd` phải null hoặc bị bỏ qua.
+7. Nếu `mode = NOTIONAL`, `notionalUsd` bắt buộc và lớn hơn zero.
+8. `leverage` bắt buộc, là integer từ 1 đến 100.
+9. Nếu account có max leverage riêng, `leverage` không được vượt max đó.
+10. `maxSlippageBps` default 5, phải từ 0 đến 100.
+11. Nếu `clientMark` khác null, phải lớn hơn zero.
+12. Nếu `tp` khác null, phải lớn hơn zero.
+13. Nếu `sl` khác null, phải lớn hơn zero.
+14. `clientOrderId` nếu có thì trim, không blank, tối đa 100 characters.
+
+##### Đọc và validate server price
+
+```text
+1. Normalize symbol
+2. Read price:last:{symbol} from Redis
+3. Nếu Redis miss, fallback latest trade trong database
+4. Nếu không có giá → 503 PRICE_UNAVAILABLE
+5. Nếu giá <= 0 → 503 PRICE_UNAVAILABLE
+6. Nếu price age > 5 seconds → 503 PRICE_STALE
+7. Gọi giá này là serverMark
+```
+
+Không dùng `clientMark` làm entry price.
+
+##### Validate slippage
+
+Nếu `clientMark` được gửi:
+
+```text
+slippageBps = abs(serverMark - clientMark)
+                / clientMark
+                × 10,000
+```
+
+Nếu:
+
+```text
+slippageBps > maxSlippageBps
+```
+
+thì trả `409 SLIPPAGE_EXCEEDED`. Không insert order.
+
+##### Validate TP/SL theo side
+
+```text
+BUY:
+  takeProfit phải > serverMark
+  stopLoss   phải < serverMark
+
+SELL:
+  takeProfit phải < serverMark
+  stopLoss   phải > serverMark
+```
+
+Ví dụ với `BUY` và `serverMark = 65000`:
+
+```text
+tp = 70000  → hợp lệ
+sl = 62000  → hợp lệ
+tp = 62000  → invalid
+sl = 70000  → invalid
+```
+
+Nếu TP/SL không hợp lệ, trả `422 INVALID_TAKE_PROFIT` hoặc `422 INVALID_STOP_LOSS`.
+
+##### Tính quantity và margin
+
+Nếu `mode = UNITS`:
+
+```text
+quantity = qtyUnits
+```
+
+Nếu `mode = NOTIONAL`:
+
+```text
+quantity = notionalUsd / serverMark
+```
+
+Sau đó:
+
+```text
+notional = abs(quantity) × serverMark
+initialMargin = notional / leverage
+maintenanceMarginRate = config.maintenanceMarginRate
+estimatedOpeningFee = notional × config.takerFeeRate
+requiredMargin = initialMargin + estimatedOpeningFee
+```
+
+Kiểm tra sau calculation:
+
+```text
+quantity > 0
+notional > 0
+initialMargin > 0
+maintenanceMarginRate >= 0
+requiredMargin > 0
+```
+
+##### Transaction và account snapshot
+
+```text
+BEGIN TRANSACTION
+
+1. Resolve account:
+   user_id = JWT userId
+   account_type = DEMO
+   status = ACTIVE
+
+2. Lock TradingAccountsEntity bằng PESSIMISTIC_WRITE.
+
+3. Nếu account không tồn tại → 404 ACCOUNT_NOT_FOUND.
+
+4. Nếu account status không ACTIVE → 403 ACCOUNT_NOT_ACTIVE.
+
+5. Nếu clientOrderId đã tồn tại trong account:
+   - Payload giống request hiện tại → trả order cũ.
+   - Payload khác request hiện tại → 409 IDEMPOTENCY_KEY_REUSED.
+
+6. Load tất cả OrdersEntity của account với status = OPEN.
+
+7. Với mỗi order OPEN:
+   - Read current mark theo order.symbol.
+   - Nếu thiếu mark của bất kỳ symbol nào → rollback + 503 PRICE_UNAVAILABLE.
+   - Tính unrealizedPnl.
+
+8. Tính account snapshot:
+   totalUnrealizedPnl = sum(position unrealizedPnl)
+   equity = account.balance + totalUnrealizedPnl
+   usedMargin = sum(position.initialMargin)
+   freeMargin = equity - usedMargin
+
+9. Nếu freeMargin < requiredMargin:
+   rollback + 400 INSUFFICIENT_FREE_MARGIN.
+
+10. Tạo OrdersEntity:
+    accountId               = account.id
+    userId                  = JWT userId
+    clientOrderId           = request clientOrderId
+    symbol                  = normalized symbol
+    side                    = request side
+    orderType               = MARKET
+    sizingMode              = request mode
+    quantity                = calculated quantity
+    entryPrice              = serverMark
+    entryMarkTimestamp      = serverMark.timestamp
+    notional                = calculated notional
+    leverage                = request leverage
+    initialMargin           = calculated initialMargin
+    maintenanceMarginRate   = configured rate
+    takeProfit              = request tp
+    stopLoss                = request sl
+    status                  = OPEN
+    tradingFee              = ZERO
+    clientMark              = request clientMark
+    clientTimestamp         = request clientTs converted to Instant
+    maxSlippageBps          = resolved max slippage
+    openedAt                = server now
+
+11. Save OrdersEntity.
+
+12. Do not update account.balance in the current isolated-margin policy.
+
+13. Do not insert ledger because balance did not change.
+
+COMMIT
+```
+
+##### Response sau khi mở order
+
+Các field response phải lấy từ entity đã lưu và calculation server:
+
+```text
+order.id          = generated database ID
+order.status      = OPEN
+order.entry       = entryPrice/serverMark
+order.volume      = quantity
+order.requiredMargin = initialMargin
+account.balance   = account.balance hiện tại
+account.equity    = snapshot.equity sau khi thêm position
+account.freeMargin = snapshot.freeMargin - requiredMargin
+account.marginUsed = snapshot.usedMargin + initialMargin
+```
+
+Event `order:placed` chỉ publish sau commit. Nếu publish thất bại, order vẫn tồn tại; production nên dùng outbox.
+
+#### 4.18.5. Manual close — đặc tả thực thi đầy đủ
+
+##### Mục tiêu
+
+Một close hợp lệ phải đồng thời:
+
+```text
+OPEN order
+  → CLOSED order
+  → account balance nhận net realized PnL
+  → ledger ghi đúng before/after
+```
+
+Nếu một trong ba thay đổi fail, rollback cả ba.
+
+##### Thứ tự xử lý
+
+```text
+1. Lấy userId từ JWT.
+2. Load order theo orderId + userId/account ownership.
+3. Nếu không tìm thấy hoặc không thuộc user → 404.
+4. Đọc server mark mới nhất của order.symbol.
+5. Nếu price missing/stale → 503.
+6. BEGIN TRANSACTION.
+7. Lock account trước.
+8. Lock/re-read order.
+9. Re-check ownership.
+10. Re-check order.status = OPEN.
+11. Tính PnL.
+12. Update order.
+13. Update account balance.
+14. Insert account ledger.
+15. COMMIT.
+16. Publish order:closed.
+```
+
+##### Tính close PnL
+
+```text
+closeNotional = abs(quantity) × closePrice
+
+BUY grossPnl  = (closePrice - entryPrice) × quantity
+SELL grossPnl = (entryPrice - closePrice) × quantity
+
+closingFee = closeNotional × takerFeeRate
+netPnl = grossPnl - closingFee
+```
+
+MVP hiện tại `takerFeeRate = 0`, vì vậy:
+
+```text
+netPnl = grossPnl
+```
+
+##### Cập nhật entity
+
+```text
+OrdersEntity:
+  status       = CLOSED
+  closeReason  = MANUAL
+  closePrice   = server mark
+  realizedPnl  = netPnl
+  tradingFee   = closingFee
+  closedAt     = server now
+
+TradingAccountsEntity:
+  balanceBefore = account.balance
+  balanceAfter  = balanceBefore + netPnl
+  account.balance = balanceAfter
+
+AccountLedgersEntity:
+  accountId     = account.id
+  orderId       = order.id
+  type          = REALIZED_PNL
+  amount        = netPnl
+  balanceBefore = balanceBefore
+  balanceAfter  = balanceAfter
+```
+
+`balanceAfter` trong ledger phải bằng đúng `TradingAccountsEntity.balance` sau update. Không làm tròn hai giá trị theo hai cách khác nhau.
+
+##### Chống close hai lần
+
+Request close phải có hàng rào cuối:
+
+```sql
+UPDATE orders
+SET status = 'CLOSED', ...
+WHERE id = :orderId
+  AND user_id = :userId
+  AND status = 'OPEN';
+```
+
+Nếu affected rows bằng `0`, không được update balance hoặc insert ledger. Đọc lại order để trả `409 ORDER_NOT_OPEN`.
+
+##### Policy isolated loss cap
+
+Để bảo đảm `trading_accounts.balance >= 0`, MVP dùng policy:
+
+```text
+maximumPositionLoss = initialMargin
+appliedPnl = max(netPnl, -maximumPositionLoss)
+balanceAfter = balanceBefore + appliedPnl
+```
+
+Nếu muốn dùng raw PnL thay vì cap, phải thay đổi database constraint và liquidation policy đồng thời. Không để manual close và liquidation dùng hai policy khác nhau.
+
+#### 4.18.6. Account snapshot — đặc tả tính toán đầy đủ
+
+##### Input
+
+```text
+JWT userId
+```
+
+##### Thứ tự đọc
+
+```text
+1. Resolve active DEMO TradingAccountsEntity theo userId.
+2. Nếu không có account → 404 ACCOUNT_NOT_FOUND.
+3. Load OrdersEntity với accountId = account.id và status = OPEN.
+4. Group open orders theo symbol.
+5. Đọc một fresh mark cho từng symbol.
+6. Nếu thiếu bất kỳ mark nào → 503 PRICE_UNAVAILABLE.
+```
+
+##### Tính cho từng position
+
+```text
+currentNotional = abs(order.quantity) × markPrice
+
+BUY uPnL  = (markPrice - order.entryPrice) × order.quantity
+SELL uPnL = (order.entryPrice - markPrice) × order.quantity
+
+positionMaintenance = currentNotional
+                       × order.maintenanceMarginRate
+```
+
+##### Tính tổng account
+
+```text
+totalUpnl = sum(position.uPnL)
+balance = account.balance
+equity = balance + totalUpnl
+usedMargin = sum(order.initialMargin)
+freeMargin = equity - usedMargin
+maintenance = sum(positionMaintenance)
+
+if usedMargin > 0:
+    marginLevel = equity / usedMargin × 100
+else:
+    marginLevel = null
+```
+
+Không lưu `equity`, `freeMargin`, `upnl` vào `trading_accounts` vì đây là dữ liệu snapshot thay đổi theo market price.
+
+##### Trường hợp không có position
+
+```text
+totalUpnl       = 0
+equity          = balance
+usedMargin      = 0
+freeMargin      = balance
+maintenance     = 0
+marginLevel     = null
+```
+
+#### 4.18.7. TP/SL — đặc tả xử lý từng market tick
+
+##### Trigger conditions
+
+```text
+BUY:
+  TP nếu lastPrice >= takeProfit
+  SL nếu lastPrice <= stopLoss
+
+SELL:
+  TP nếu lastPrice <= takeProfit
+  SL nếu lastPrice >= stopLoss
+```
+
+Nếu field TP/SL là null, điều kiện tương ứng luôn là false.
+
+##### Flow
+
+```text
+1. Nhận TradesEntity/market tick.
+2. Validate price > 0.
+3. Update latest price cache.
+4. Query orders WHERE symbol = tick.symbol AND status = OPEN.
+5. Với từng order, xác định trigger reason.
+6. Nếu không trigger, bỏ qua.
+7. Nếu cả TP và SL cùng trigger trên một tick, MVP ưu tiên TP.
+8. Gọi chung CloseOrderService với:
+   closeReason = TP hoặc SL
+   closePrice  = tick.price
+9. CloseService lock account/order và re-check status.
+10. Chỉ request thắng conditional update mới update balance/ledger.
+11. Commit.
+12. Publish private alert sau commit.
+```
+
+TP/SL không được tự viết lại PnL formula. Chúng chỉ quyết định `closeReason` và gọi close infrastructure dùng chung.
+
+#### 4.18.8. Liquidation — đặc tả risk check đầy đủ
+
+##### Tính risk của một position
+
+```text
+currentNotional = abs(quantity) × markPrice
+unrealizedPnl   = side-specific uPnL
+positionEquity  = initialMargin + unrealizedPnl
+maintenance     = currentNotional × maintenanceMarginRate
+liquidationFeeReserve = currentNotional × liquidationFeeRate
+```
+
+Trigger liquidation khi:
+
+```text
+positionEquity <= maintenance + liquidationFeeReserve
+```
+
+Nếu MVP chưa có liquidation fee, `liquidationFeeRate = 0`.
+
+##### Flow
+
+```text
+1. Market tick tới.
+2. Chỉ query OPEN orders của tick.symbol.
+3. Tính risk bằng tick.price.
+4. Position chưa đạt threshold → không thay đổi database.
+5. Position đạt threshold → bắt đầu transaction.
+6. Lock TradingAccountsEntity.
+7. Lock/re-read OrdersEntity.
+8. Nếu order không còn OPEN → dừng, không ghi ledger.
+9. Đọc/recompute giá và risk sau lock.
+10. Nếu risk không còn đạt threshold → rollback, giữ OPEN.
+11. Nếu vẫn đạt threshold:
+    status      = LIQUIDATED
+    closeReason = LIQUIDATION
+    closePrice  = latest mark
+    realizedPnl = applied liquidation PnL
+    closedAt    = now
+12. Update account balance.
+13. Insert ledger type = LIQUIDATION.
+14. COMMIT.
+15. Publish private liquidation alert.
+```
+
+Liquidation phải re-check sau lock vì manual close hoặc TP/SL có thể đã xử lý position trong lúc risk worker đang chạy.
+
+#### 4.18.9. Refresh token và logout — đặc tả session
+
+##### Refresh
+
+```text
+1. Đọc raw refresh token từ HttpOnly cookie.
+2. Nếu null/blank → 401.
+3. Hash raw token bằng SHA-256.
+4. Tìm RefreshTokensEntity theo tokenHash.
+5. Nếu không tìm thấy → 401.
+6. Nếu revokedAt != null → 401.
+7. Nếu expiresAt <= now → 401.
+8. Set lastUsedAt = now.
+9. Set revokedAt = now cho token cũ.
+10. Generate raw token mới.
+11. Hash và insert token mới.
+12. Load UsersEntity theo userId và kiểm tra enabled.
+13. Issue access JWT mới.
+14. Set cookie mới.
+15. Commit.
+```
+
+##### Logout
+
+```text
+1. Đọc raw token từ cookie.
+2. Nếu thiếu token, vẫn clear cookie và trả thành công.
+3. Hash token.
+4. Tìm token active.
+5. Nếu có, set revokedAt = now.
+6. Clear HttpOnly cookie.
+```
+
+Logout không thay đổi `users`, `trading_accounts`, `orders` hoặc `account_ledgers`.
+
+#### 4.18.10. Bảng lỗi theo từng bước
+
+| Bước | Điều kiện | Error |
+|---|---|---|
+| Authentication | JWT thiếu/sai/hết hạn | `401 UNAUTHORIZED` |
+| Ownership | User không sở hữu account/order | `404 NOT_FOUND` |
+| Account | Account không tồn tại | `404 ACCOUNT_NOT_FOUND` |
+| Account | Account không ACTIVE | `403 ACCOUNT_NOT_ACTIVE` |
+| Price | Không có server price | `503 PRICE_UNAVAILABLE` |
+| Price | Price quá cũ | `503 PRICE_STALE` |
+| Order input | Symbol không hỗ trợ | `422 UNSUPPORTED_SYMBOL` |
+| Order input | Sai side/mode | `422 INVALID_SIDE`/`INVALID_MODE` |
+| Order input | Quantity/notional không hợp lệ | `422 INVALID_QUANTITY`/`INVALID_NOTIONAL` |
+| Order input | Leverage ngoài 1..100 | `422 INVALID_LEVERAGE` |
+| Order input | TP/SL sai hướng | `422 INVALID_TAKE_PROFIT`/`INVALID_STOP_LOSS` |
+| Slippage | Vượt max slippage | `409 SLIPPAGE_EXCEEDED` |
+| Idempotency | Key trùng payload khác | `409 IDEMPOTENCY_KEY_REUSED` |
+| Margin | Free margin không đủ | `400 INSUFFICIENT_FREE_MARGIN` |
+| State | Close order không phải OPEN | `409 ORDER_NOT_OPEN` |
+| Refresh | Token revoked/expired/unknown | `401 INVALID_REFRESH_TOKEN` |
+
+Mỗi error phải dừng flow ngay tại bước phát hiện. Không được tiếp tục save entity sau khi đã xác định request invalid.
+
+#### 4.18.11. Unit test cases bắt buộc cho calculator
+
+##### Quantity and margin
+
+```text
+UNITS: quantity = 0.01
+NOTIONAL: notionalUsd = 650, mark = 65000 → quantity = 0.01
+notional = quantity × mark
+initialMargin = notional / leverage
+```
+
+Test thêm:
+
+- Zero quantity.
+- Negative quantity.
+- Leverage 0, 1, 100, 101.
+- Decimal scale và rounding.
+- Quantity quá precision cho instrument.
+
+##### PnL
+
+Với entry `65000`, close `65100`, quantity `0.01`:
+
+```text
+BUY  PnL = (65100 - 65000) × 0.01 = 1.00
+SELL PnL = (65000 - 65100) × 0.01 = -1.00
+```
+
+Test thêm:
+
+- BUY profit/loss.
+- SELL profit/loss.
+- Zero fee.
+- Opening/closing fee khi bật fee.
+- Loss cap.
+
+##### TP/SL
+
+- BUY TP trigger tại đúng giá.
+- BUY SL trigger tại đúng giá.
+- SELL TP trigger tại đúng giá.
+- SELL SL trigger tại đúng giá.
+- TP/SL null.
+- Cả TP và SL trigger cùng một tick.
+
+##### Account snapshot
+
+- Không có open position.
+- Một BUY có profit.
+- Một SELL có loss.
+- Nhiều symbol.
+- Thiếu một server mark.
+- `usedMargin = 0` phải trả `marginLevel = null`.
+
+#### 4.18.12. Integration test flow hoàn chỉnh
+
+```text
+1. Signup user.
+2. Assert users row exists.
+3. Assert one DEMO account with balance 5000.
+4. Assert INITIAL_DEPOSIT ledger before=0, after=5000.
+5. Signin và nhận JWT.
+6. GET /auth/me bằng JWT.
+7. Mock fresh BTCUSDT price.
+8. Place BUY order.
+9. Assert order OPEN.
+10. Assert account.balance chưa đổi theo isolated-margin policy.
+11. Assert account.usedMargin tăng.
+12. Mock price tăng.
+13. GET account snapshot và assert uPnL/equity/freeMargin.
+14. Close order.
+15. Assert order CLOSED.
+16. Assert realizedPnl đúng.
+17. Assert account.balance nhận PnL.
+18. Assert REALIZED_PNL ledger before/after đúng.
+19. Repeat close request.
+20. Assert không có ledger thứ hai và không cộng PnL lần hai.
+```
+
+Mục tiêu của integration test là xác nhận **nhiều entity thay đổi đúng cùng nhau**, không chỉ kiểm tra HTTP status `200`.
+
+---
+
 ## 5. REST API conventions
 
 ### 5.1. Base URL
@@ -2202,6 +3585,685 @@ Không lưu canonical user balance/order JSON trong Redis.
 
 ---
 
+### 15.4. Messaging architecture — phân biệt cache, channel và queue
+
+Trong project này, Redis và queue có ba vai trò khác nhau:
+
+| Thành phần | Mục đích | Có cần giữ message không? | Ví dụ |
+|---|---|---:|---|
+| Redis key/cache | Lấy nhanh state mới nhất | Không cần lịch sử | Latest BTC price |
+| Redis Pub/Sub | Broadcast realtime | Không, subscriber offline sẽ mất message | Public trade, private alert |
+| Queue/Redis Stream | Xử lý bất đồng bộ và retry | Có | Trade writer, risk worker |
+| PostgreSQL/outbox | Nguồn sự thật cho business event | Có | Order placed/closed |
+| WebSocket | Gửi dữ liệu tới browser | Không phải persistence | `/ws/` |
+
+Không dùng Redis Pub/Sub làm queue cho các tác vụ bắt buộc phải xử lý. Pub/Sub không có acknowledgement, không replay và không giữ message cho consumer offline.
+
+Flow tổng quát:
+
+```text
+Binance WebSocket
+    │
+    ▼
+MarketDataClient
+    │ parse/validate/normalize
+    ▼
+MarketTick ingress queue
+    │
+    ├──> Update Redis latest-price cache
+    ├──> Persist trades batch vào PostgreSQL/TimescaleDB
+    ├──> Publish public market event
+    └──> Send tick to TP/SL/liquidation risk worker
+
+Order transaction
+    │ update order/account/ledger + outbox trong cùng transaction
+    ▼
+OutboxPublisher
+    │
+    ├──> Redis private user channel
+    └──> Private WebSocket session
+```
+
+#### 15.5. Canonical channels của project
+
+Dùng version trong tên channel để sau này thay đổi payload mà không phá consumer cũ.
+
+| Channel | Producer | Consumer | Dữ liệu |
+|---|---|---|---|
+| `pubsub:market:trades:v1` | Market tick processor | Public WebSocket subscriber | Trade mới nhất cho mọi client |
+| `pubsub:market:status:v1` | Binance connection manager | Health/monitoring | Connected, reconnecting, unhealthy |
+| `pubsub:orders:user:{userId}:v1` | Outbox publisher | Private WebSocket gateway | Order placed/closed của một user |
+| `pubsub:alerts:user:{userId}:v1` | Risk/order service via outbox | Private WebSocket gateway | TP, SL, liquidation alert |
+| `pubsub:account:user:{userId}:v1` | Account/order service via outbox | Private WebSocket gateway | Account snapshot changed, nếu cần |
+
+Mapping với tên ngắn trong phần thiết kế cũ:
+
+```text
+trades             -> pubsub:market:trades:v1
+orders:{userId}    -> pubsub:orders:user:{userId}:v1
+alerts:{userId}    -> pubsub:alerts:user:{userId}:v1
+```
+
+Không publish private event vào `pubsub:market:trades:v1`.
+
+#### 15.6. Redis key contract
+
+##### Latest price
+
+Dùng hai String key để đọc đơn giản và tương thích với `MarketPriceService`:
+
+```text
+price:last:BTCUSDT       -> "65000.250000000000"
+price:last:BTCUSDT:ts    -> "1784100000123"
+
+price:last:ETHUSDT       -> "3500.120000000000"
+price:last:ETHUSDT:ts    -> "1784100000123"
+
+price:last:SOLUSDT       -> "150.450000000000"
+price:last:SOLUSDT:ts    -> "1784100000123"
+```
+
+Write cùng một tick:
+
+```text
+SET price:last:{SYMBOL} value EX 60
+SET price:last:{SYMBOL}:ts epochMillis EX 60
+```
+
+Khi đọc:
+
+1. Đọc price và timestamp.
+2. Parse price bằng `BigDecimal`.
+3. Tính `now - timestamp`.
+4. Chỉ chấp nhận nếu age không vượt `trading.max-price-age`.
+5. Redis miss hoặc stale thì fallback query database.
+6. Không dùng `clientMark` để thay thế server price.
+
+##### Lock keys
+
+```text
+lock:close:{orderId}
+lock:market:leader
+lock:outbox:publisher:{shard}
+```
+
+| Key | TTL | Mục đích |
+|---|---:|---|
+| `lock:close:{orderId}` | 5 seconds | Tránh manual close và TP/SL cùng xử lý |
+| `lock:market:leader` | 10 seconds | Một instance giữ Binance connection khi scale |
+| `lock:outbox:publisher:{shard}` | 30 seconds | Tránh nhiều publisher đọc cùng shard nếu cần |
+
+Redis lock chỉ là lớp tối ưu. Database conditional update vẫn là hàng rào cuối cùng.
+
+##### Health keys
+
+```text
+market:binance:status       -> CONNECTED/RECONNECTING/UNHEALTHY
+market:binance:last-message-ts -> epochMillis
+market:binance:instance     -> instance identifier
+```
+
+Không lưu canonical `balance`, `OrdersEntity` hoặc account state trong Redis. PostgreSQL là nguồn sự thật.
+
+#### 15.7. Event envelope dùng cho mọi channel
+
+Mọi event nên có envelope thống nhất:
+
+```json
+{
+  "eventId": "01JABC...",
+  "schemaVersion": 1,
+  "type": "market.trade",
+  "occurredAt": "2026-08-09T10:15:30.123Z",
+  "aggregateType": "market",
+  "aggregateId": "BTCUSDT",
+  "userId": null,
+  "payload": {}
+}
+```
+
+Quy tắc:
+
+- `eventId` unique để log và deduplicate.
+- `schemaVersion` là integer.
+- `type` là constant, không lấy từ input client.
+- `occurredAt` là server event time ISO-8601.
+- `aggregateId` là symbol/order ID/user ID tùy event.
+- Event public phải có `userId = null`.
+- Domain money/PnL nên serialize thành string để tránh mất precision.
+- Public trade payload giữ `price`, `quantity`, `timestamp` dạng number nếu frontend hiện tại yêu cầu number.
+
+#### 15.8. Public market trade event
+
+Channel:
+
+```text
+pubsub:market:trades:v1
+```
+
+Payload Redis/domain:
+
+```json
+{
+  "eventId": "trade-event-001",
+  "schemaVersion": 1,
+  "type": "market.trade",
+  "occurredAt": "2026-08-09T10:15:30.123Z",
+  "aggregateType": "market",
+  "aggregateId": "BTCUSDT",
+  "userId": null,
+  "payload": {
+    "type": "trade",
+    "timestamp": 1784100000123,
+    "ts": 1784100000123,
+    "asset": "BTCUSDT",
+    "symbol": "BTCUSDT",
+    "price": 65000.25,
+    "quantity": 0.015
+  }
+}
+```
+
+Flow:
+
+```text
+Binance aggTrade
+    -> parse p/q/T/a/s
+    -> validate price and quantity
+    -> normalize symbol
+    -> create MarketTick
+    -> update latest-price cache
+    -> publish pubsub:market:trades:v1
+    -> WebSocket subscriber forwards payload to public sessions
+```
+
+Public clients chỉ nhận market data. Không gửi email, balance, account ID, order ID hoặc JWT claim vào channel này.
+
+#### 15.9. Private order event
+
+Channel:
+
+```text
+pubsub:orders:user:{userId}:v1
+```
+
+Payload khi đặt order:
+
+```json
+{
+  "eventId": "order-event-001",
+  "schemaVersion": 1,
+  "type": "order.placed",
+  "occurredAt": "2026-08-09T10:15:30.123Z",
+  "aggregateType": "order",
+  "aggregateId": "101",
+  "userId": 7,
+  "payload": {
+    "orderId": "101",
+    "accountId": "11",
+    "symbol": "BTCUSDT",
+    "side": "BUY",
+    "status": "OPEN",
+    "quantity": "0.010000000000",
+    "entryPrice": "65000.250000000000",
+    "notional": "650.002500000000",
+    "initialMargin": "65.000250000000",
+    "leverage": 10,
+    "takeProfit": "70000.000000000000",
+    "stopLoss": "62000.000000000000",
+    "openedAt": "2026-08-09T10:15:30.123Z"
+  }
+}
+```
+
+Payload khi close:
+
+```json
+{
+  "eventId": "order-event-002",
+  "schemaVersion": 1,
+  "type": "order.closed",
+  "occurredAt": "2026-08-09T10:20:30.123Z",
+  "aggregateType": "order",
+  "aggregateId": "101",
+  "userId": 7,
+  "payload": {
+    "orderId": "101",
+    "accountId": "11",
+    "symbol": "BTCUSDT",
+    "status": "CLOSED",
+    "closeReason": "MANUAL",
+    "closePrice": "65100.000000000000",
+    "realizedPnl": "1.00000000",
+    "tradingFee": "0.00000000",
+    "closedAt": "2026-08-09T10:20:30.123Z"
+  }
+}
+```
+
+Chỉ publish tới channel của đúng `userId`. Không dùng một channel chung chứa private events của mọi user.
+
+#### 15.10. Private risk alert event
+
+Channel:
+
+```text
+pubsub:alerts:user:{userId}:v1
+```
+
+Payload TP/SL/liquidation:
+
+```json
+{
+  "eventId": "alert-001",
+  "schemaVersion": 1,
+  "type": "risk.liquidation",
+  "occurredAt": "2026-08-09T10:20:30.123Z",
+  "aggregateType": "order",
+  "aggregateId": "101",
+  "userId": 7,
+  "payload": {
+    "orderId": "101",
+    "symbol": "BTCUSDT",
+    "reason": "LIQUIDATION",
+    "triggerPrice": "60000.000000000000",
+    "realizedPnl": "-65.00000000",
+    "message": "Position was liquidated"
+  }
+}
+```
+
+Alert không tự thay thế order state. Client vẫn phải gọi REST `/orders` hoặc `/account` để đồng bộ lại state nếu reconnect sau khi mất WebSocket.
+
+#### 15.11. Internal market tick queue
+
+##### MVP một instance
+
+Dùng queue bounded trong memory để tách Binance network thread khỏi database/WebSocket/risk processing:
+
+```text
+Binance WebSocket callback
+    -> marketTickIngressQueue.put(tick)
+
+MarketTickWorker
+    -> take tick
+    -> update cache
+    -> persist batch
+    -> publish public event
+    -> submit risk evaluation
+```
+
+Data structure đề xuất:
+
+```java
+BlockingQueue<MarketTick> marketTickIngressQueue =
+        new ArrayBlockingQueue<>(10_000);
+```
+
+`MarketTick`:
+
+```text
+eventId
+symbol
+price: BigDecimal
+quantity: BigDecimal
+sourceTradeId: Long
+eventTime: Instant
+receivedAt: Instant
+source: BINANCE
+```
+
+Không để Binance callback gọi trực tiếp database hoặc `session.sendMessage()`. Callback chỉ parse, validate cơ bản và đưa tick vào queue.
+
+##### Backpressure
+
+Tách hai loại queue:
+
+```text
+riskQueue / persistenceQueue
+    -> không được drop âm thầm
+    -> block, retry hoặc chuyển sang durable stream
+
+publicWebSocketQueue mỗi session
+    -> có thể drop tick cũ
+    -> ưu tiên giá mới nhất
+```
+
+Nếu `riskQueue` đầy:
+
+1. Mark market-data health là degraded.
+2. Không tiếp tục giả định risk evaluation đã xử lý đủ tick.
+3. Retry hoặc chuyển tick sang Redis Stream.
+4. Không silently discard tick cho liquidation.
+
+##### Scale nhiều instance: Redis Streams
+
+Khi chạy nhiều backend instance, thay queue nội bộ bằng:
+
+```text
+stream:market:ticks:v1
+```
+
+Consumer groups:
+
+| Consumer group | Nhiệm vụ | Ack khi nào |
+|---|---|---|
+| `market-trade-writer` | Batch insert `trades` | Sau khi database batch commit |
+| `market-risk-engine` | TP/SL/liquidation | Sau khi risk transaction commit |
+| `market-public-broadcaster` | Publish public trade channel | Sau khi Redis publish thành công |
+
+Mỗi group nhận một bản độc lập của stream entry. Các instance trong cùng group chia nhau xử lý để scale.
+
+Stream entry:
+
+```text
+XADD stream:market:ticks:v1 *
+  eventId trade-event-001
+  symbol BTCUSDT
+  price 65000.25
+  quantity 0.015
+  sourceTradeId 123456
+  eventTime 1784100000123
+```
+
+Consumer phải:
+
+1. `XREADGROUP` với consumer name duy nhất.
+2. Parse message.
+3. Validate schema.
+4. Xử lý idempotent theo `sourceTradeId`/`eventId`.
+5. `XACK` sau khi xử lý thành công.
+6. Claim pending message nếu consumer chết.
+7. Retry giới hạn.
+8. Đưa message lỗi vào `stream:dead-letter:v1`.
+
+Redis Streams là queue durable hơn Pub/Sub, nhưng PostgreSQL vẫn là nguồn sự thật cho order/balance/ledger.
+
+#### 15.12. Market tick processing chi tiết
+
+```text
+1. BinanceMessageListener nhận raw JSON.
+2. Parse field:
+   a -> sourceTradeId
+   s -> symbol
+   p -> price
+   q -> quantity
+   T -> eventTime
+3. Normalize symbol sang SymbolEnum.
+4. Parse price/quantity bằng BigDecimal.
+5. Reject price <= 0 hoặc quantity <= 0.
+6. Tạo eventId deterministic hoặc UUID.
+7. Đưa MarketTick vào ingress queue/stream.
+8. MarketTickWorker xử lý:
+   a. Update price:last:{SYMBOL} và timestamp atomically.
+   b. Add tick vào batch writer.
+   c. Publish market event.
+   d. Submit risk event theo symbol.
+9. Batch writer insert TradesEntity.
+10. Risk engine query OPEN orders theo symbol.
+11. TP/SL/liquidation dùng tick price.
+```
+
+Nếu database insert bị duplicate `sourceTradeId`, coi đó là duplicate delivery và ack message; không tạo thêm trade.
+
+#### 15.13. Outbox cho order/account events
+
+Redis Pub/Sub không bảo đảm event sau commit. Khi order transaction cần phát event đáng tin cậy:
+
+```text
+BEGIN TRANSACTION
+    update orders
+    update trading_accounts
+    insert account_ledgers
+    insert outbox_events
+COMMIT
+
+OutboxPublisher
+    -> read unpublished outbox row
+    -> publish Redis private channel
+    -> set published_at
+```
+
+`outbox_events` fields:
+
+```text
+id: UUID
+aggregate_type: ORDER/ACCOUNT
+aggregate_id: String
+event_type: order.placed/order.closed/account.updated
+user_id: Long
+payload: JSONB
+created_at: TIMESTAMPTZ
+published_at: TIMESTAMPTZ nullable
+retry_count: integer
+last_error: text nullable
+```
+
+Outbox publisher flow:
+
+```text
+1. Select unpublished rows ordered by created_at.
+2. Lock a small batch with SKIP LOCKED nếu có nhiều publisher.
+3. Publish tới channel theo event_type/user_id.
+4. Nếu publish thành công, set published_at.
+5. Nếu fail, tăng retry_count và giữ lại row.
+6. Sau max retry, chuyển sang dead-letter/alert ops.
+```
+
+Không đánh dấu `published_at` trước khi `RedisTemplate.convertAndSend` thành công.
+
+#### 15.14. WebSocket server flow
+
+##### Public endpoint
+
+```text
+GET /ws/
+```
+
+Client lifecycle:
+
+```text
+Browser connects /ws/
+    -> WebSocketHandler.afterConnectionEstablished
+    -> register session
+    -> subscribe session to public market broadcaster
+    -> receive market.trade events
+    -> ping/pong heartbeat
+    -> unregister on close/error
+```
+
+Public session registry:
+
+```text
+ConcurrentHashMap<String, WebSocketSession>
+```
+
+Không giữ session đã closed. Kiểm tra `session.isOpen()` trước send.
+
+##### Public broadcast
+
+```text
+Redis subscriber nhận pubsub:market:trades:v1
+    -> deserialize envelope
+    -> lấy envelope.payload
+    -> enqueue cho từng public WebSocket session
+    -> session send async/non-blocking
+```
+
+Nếu một browser chậm:
+
+- Không block Redis subscriber thread.
+- Có bounded outbound queue cho session.
+- Drop trade cũ khi queue đầy.
+- Giữ trade mới nhất.
+- Đóng session nếu client liên tục không đọc được.
+
+##### Private endpoint sau MVP
+
+Không dùng JWT dài hạn trong query string:
+
+```text
+Không nên: /ws/private?token=<long-lived-jwt>
+```
+
+Flow đề xuất:
+
+```text
+1. Browser gọi REST tạo one-time WebSocket ticket.
+2. Server lưu hash ticket vào Redis:
+   ws:ticket:{hash} -> userId, TTL 60s
+3. Browser connect /ws/private.
+4. Browser gửi auth message chứa one-time ticket.
+5. Server consume/delete ticket atomically.
+6. Server đăng ký session vào userId.
+7. Subscriber chỉ forward:
+   pubsub:orders:user:{userId}:v1
+   pubsub:alerts:user:{userId}:v1
+8. Ticket dùng một lần và không được reuse.
+```
+
+MVP hiện tại chỉ cần `/ws/` public market stream. Chưa gửi private events qua public socket.
+
+#### 15.15. Java components cần implement
+
+```text
+marketdata/
+├── BinanceMarketDataClient
+│   └── WebSocket listener, reconnect, parse raw Binance messages
+├── MarketTick
+├── MarketTickIngressQueue
+├── MarketTickWorker
+├── MarketPriceService
+├── LatestPriceCache
+│   └── StringRedisTemplate read/write price and timestamp
+├── TradeBatchWriter
+│   └── batch insert TradesEntity
+└── RiskTickPublisher
+
+realtime/
+├── WebSocketConfig
+├── MarketWebSocketHandler
+├── WebSocketSessionRegistry
+├── RedisMarketSubscriber
+├── PrivateEventSubscriber
+└── WebSocketOutboundQueue
+
+messaging/
+├── RedisChannelNames
+├── EventEnvelope
+├── RedisPublisher
+├── RedisStreamConsumer
+├── OutboxPublisher
+└── DeadLetterPublisher
+```
+
+Trách nhiệm:
+
+| Component | Không được làm |
+|---|---|
+| Binance client | Không ghi trực tiếp order/account |
+| Redis cache | Không là nguồn sự thật của balance/order |
+| Market tick worker | Không giữ transaction dài khi gọi external service |
+| WebSocket handler | Không tự query toàn bộ database mỗi tick |
+| Redis subscriber | Không block vì một browser chậm |
+| Risk engine | Không bỏ qua conditional update khi close |
+| Outbox publisher | Không đánh dấu published trước khi publish thành công |
+
+#### 15.16. Redis Java configuration blueprint
+
+Dependencies cần thêm nếu chưa có:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-websocket</artifactId>
+</dependency>
+```
+
+Cho MVP dùng `StringRedisTemplate` để key/value và JSON payload dễ debug:
+
+```java
+@Bean
+RedisTemplate<String, String> redisTemplate(
+        RedisConnectionFactory connectionFactory
+) {
+    RedisTemplate<String, String> template = new RedisTemplate<>();
+    template.setConnectionFactory(connectionFactory);
+    template.setKeySerializer(new StringRedisSerializer());
+    template.setValueSerializer(new StringRedisSerializer());
+    template.afterPropertiesSet();
+    return template;
+}
+```
+
+Publisher contract:
+
+```java
+public void publish(String channel, EventEnvelope event) {
+    String json = objectMapper.writeValueAsString(event);
+    stringRedisTemplate.convertAndSend(channel, json);
+}
+```
+
+Không serialize entity JPA trực tiếp vào event. Map entity sang event DTO để tránh lazy-loading, password/hash leakage và schema coupling.
+
+#### 15.17. Failure, retry và delivery semantics
+
+| Flow | Delivery | Retry strategy |
+|---|---|---|
+| Latest price cache | Best effort | Tick sau sẽ overwrite |
+| Public trade Pub/Sub | At-most-once | Client reconnect gọi REST/latest endpoint |
+| Trade persistence | At-least-once input | DB unique `(asset, source_trade_id)` |
+| Risk processing | At-least-once | Conditional order state update |
+| Private order event | At-least-once via outbox | Retry until published |
+| WebSocket delivery | Best effort | Client refetch state after reconnect |
+
+Không hứa exactly-once ở Redis/WebSocket. Đảm bảo business exactly-once bằng database constraint, transaction và conditional update.
+
+#### 15.18. Channel và queue test checklist
+
+```text
+[ ] Binance reconnect không tạo duplicate sourceTradeId
+[ ] Latest-price key có timestamp và stale check
+[ ] Public trade message đúng schema và timestamp milliseconds
+[ ] Public client không nhận private order event
+[ ] Redis subscriber reconnect được
+[ ] WebSocket close/error cleanup session
+[ ] Slow WebSocket client không block market tick worker
+[ ] Risk queue đầy không silently drop tick
+[ ] Stream consumer ACK chỉ sau xử lý thành công
+[ ] Pending stream message được claim sau consumer crash
+[ ] Outbox event chỉ published_at sau Redis publish thành công
+[ ] Failed outbox publish được retry
+[ ] Manual close và TP/SL đồng thời chỉ một bên realize PnL
+[ ] Redis unavailable làm health degraded và chặn execute order khi thiếu price
+```
+
+#### 15.19. Recommended implementation order
+
+```text
+1. WebSocketConfig + public MarketWebSocketHandler
+2. WebSocketSessionRegistry + heartbeat/cleanup
+3. Redis StringRedisTemplate latest-price cache
+4. BinanceMarketDataClient + MarketTick parser
+5. Bounded in-memory ingress queue
+6. MarketTickWorker + trade batch writer
+7. Redis public Pub/Sub publisher/subscriber
+8. Public WebSocket broadcast
+9. TP/SL risk queue and shared close service
+10. OutboxEventsEntity + OutboxPublisher
+11. Private order/alert channels
+12. Redis Streams consumer groups when scaling instances
+13. Dead-letter, metrics, health and load tests
+```
+
+---
+
 ## 16. Configuration
 
 ### 16.1. application.yml
@@ -2240,6 +4302,8 @@ spring:
       host: redis
       port: 6379
       timeout: 2s
+      repositories:
+        enabled: false
 
 management:
   endpoints:
@@ -2264,6 +4328,23 @@ market-data:
   binance-url: wss://fstream.binance.com/stream
   batch-size: 100
   flush-interval: 1s
+  ingress-queue-capacity: 10000
+  stream-key: stream:market:ticks:v1
+
+websocket:
+  public-path: /ws/
+  allowed-origins: http://localhost:5173
+  heartbeat-interval: 30s
+  session-queue-capacity: 100
+  private-enabled: false
+
+messaging:
+  public-trades-channel: pubsub:market:trades:v1
+  market-status-channel: pubsub:market:status:v1
+  order-channel-prefix: pubsub:orders:user:
+  alert-channel-prefix: pubsub:alerts:user:
+  outbox-poll-interval: 1s
+  stream-max-retries: 5
 ```
 
 Password, JWT key và database credentials phải đến từ environment/secret manager.

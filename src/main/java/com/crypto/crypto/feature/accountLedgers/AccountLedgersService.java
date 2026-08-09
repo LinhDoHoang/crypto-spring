@@ -1,10 +1,14 @@
 package com.crypto.crypto.feature.accountLedgers;
 
 import com.crypto.crypto.entities.AccountLedgersEntity;
+import com.crypto.crypto.config.ResourceNotFoundException;
 import com.crypto.crypto.feature.accountLedgers.dto.AccountLedgersResponse;
 import com.crypto.crypto.feature.accountLedgers.dto.CreateAccountLedgerDto;
 import com.crypto.crypto.feature.accountLedgers.dto.UpdateAccountLedgerDto;
 import com.crypto.crypto.feature.accountLedgers.exception.AccountLedgerNotfound;
+import com.crypto.crypto.feature.tradingAccounts.TradingAccountRepository;
+import com.crypto.crypto.feature.tradingAccounts.constant.AccountTypeEnum;
+import com.crypto.crypto.feature.tradingAccounts.constant.StatusEnum;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -14,9 +18,14 @@ import java.util.List;
 @Service
 public class AccountLedgersService {
     private final AccountLedgersRepository accountLedgersRepository;
+    private final TradingAccountRepository tradingAccountRepository;
 
-    AccountLedgersService(AccountLedgersRepository accountLedgersRepository) {
+    AccountLedgersService(
+            AccountLedgersRepository accountLedgersRepository,
+            TradingAccountRepository tradingAccountRepository
+    ) {
         this.accountLedgersRepository = accountLedgersRepository;
+        this.tradingAccountRepository = tradingAccountRepository;
     }
 
     @Transactional
@@ -67,6 +76,27 @@ public class AccountLedgersService {
                 .findAll();
 
         return accountLedgersEntities.stream()
+                .map(AccountLedgersResponse::from)
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
+    public List<AccountLedgersResponse> getForUser(Long userId) {
+        Long accountId = tradingAccountRepository
+                .findByUserIdAndAccountTypeAndStatus(
+                        userId,
+                        AccountTypeEnum.DEMO,
+                        StatusEnum.ACTIVE
+                )
+                .map(account -> account.getId())
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Trading account",
+                        userId
+                ));
+
+        return accountLedgersRepository
+                .findByAccountIdOrderByCreatedAtDesc(accountId)
+                .stream()
                 .map(AccountLedgersResponse::from)
                 .toList();
     }

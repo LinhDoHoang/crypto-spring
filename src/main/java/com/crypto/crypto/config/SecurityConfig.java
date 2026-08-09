@@ -73,7 +73,8 @@ public class SecurityConfig {
                                 "/auth/signup",
                                 "/auth/signin",
                                 "/auth/refresh",
-                                "/auth/logout")
+                                "/auth/logout",
+                                "/auth/test")
                         .permitAll()
                         .requestMatchers(HttpMethod.GET,
                                 "/candles",
@@ -82,7 +83,12 @@ public class SecurityConfig {
                                 "/api-docs/**",
                                 "/swagger-ui/**")
                         .permitAll()
-                        .requestMatchers("/users/**")
+                        .requestMatchers(
+                                "/users/**",
+                                "/trading-accounts/**",
+                                "/account-ledgers/**",
+                                "/trades/**"
+                        )
                         .denyAll()
                         .anyRequest()
                         .authenticated())

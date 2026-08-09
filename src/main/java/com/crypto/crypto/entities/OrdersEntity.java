@@ -17,6 +17,7 @@ import org.hibernate.type.SqlTypes;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.List;
 
 @Entity
 @Table(name = "orders")
@@ -36,6 +37,9 @@ public class OrdersEntity extends ModifiedEntity {
 
     @Column(name = "user_id", nullable = false)
     private Long userId;
+
+    @Column(name = "trading_account_id", nullable = false)
+    private Long tradingAccountId;
 
     @Column(name = "client_order_id", length = 100)
     private String clientOrderId;
@@ -138,4 +142,17 @@ public class OrdersEntity extends ModifiedEntity {
             updatable = false
     )
     private UsersEntity user;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(
+            name = "trading_account_id",
+            referencedColumnName = "id",
+            nullable = false,
+            insertable = false,
+            updatable = false
+    )
+    private TradingAccountsEntity tradingAccount;
+
+    @OneToMany(mappedBy = "order", fetch = FetchType.LAZY)
+    private List<AccountLedgersEntity> accountLedger;
 }

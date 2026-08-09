@@ -8,6 +8,7 @@ import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 @Entity
 @Table(name = "trading_accounts")
@@ -63,4 +64,7 @@ public class TradingAccountsEntity extends ModifiedEntity {
             updatable = false
     )
     private UsersEntity user;
+
+    @OneToMany(mappedBy = "tradingAccount", fetch = FetchType.LAZY)
+    private List<OrdersEntity> orders;
 }

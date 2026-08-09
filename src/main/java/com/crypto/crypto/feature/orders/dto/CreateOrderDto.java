@@ -25,10 +25,6 @@ public class CreateOrderDto {
     @Positive
     private Long accountId;
 
-    @NotNull
-    @Positive
-    private Long userId;
-
     @Size(max = 100)
     private String clientOrderId;
 
