@@ -1,5 +1,8 @@
 package com.crypto.crypto.config.redis;
 
+import lombok.Getter;
+
+@Getter
 public enum RedisChannels {
     TRADES("trades");
 
@@ -7,9 +10,5 @@ public enum RedisChannels {
 
     RedisChannels(String channelName) {
         this.channelName = channelName;
-    }
-
-    public String getChannelName() {
-        return this.channelName;
     }
 }
