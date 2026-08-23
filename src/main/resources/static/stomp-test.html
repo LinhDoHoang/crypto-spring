@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>STOMP WebSocket Tester</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7.2.1/bundles/stomp.umd.min.js"></script>
+
+    <style>
+        :root {
+            color-scheme: dark;
+            font-family: Inter, Arial, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: #111827;
+            color: #e5e7eb;
+        }
+
+        .container {
+            width: min(900px, calc(100% - 32px));
+            margin: 40px auto;
+        }
+
+        h1 {
+            margin-bottom: 24px;
+        }
+
+        .panel {
+            padding: 24px;
+            margin-bottom: 20px;
+            background: #1f2937;
+            border: 1px solid #374151;
+            border-radius: 12px;
+        }
+
+        label {
+            display: block;
+            margin: 16px 0 8px;
+            font-weight: 600;
+        }
+
+        input,
+        textarea {
+            width: 100%;
+            padding: 12px;
+            color: #f9fafb;
+            background: #111827;
+            border: 1px solid #4b5563;
+            border-radius: 8px;
+            font: inherit;
+        }
+
+        textarea {
+            min-height: 140px;
+            resize: vertical;
+            font-family: monospace;
+        }
+
+        button {
+            padding: 11px 18px;
+            margin: 20px 8px 0 0;
+            border: 0;
+            border-radius: 8px;
+            color: white;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        #connectButton {
+            background: #16a34a;
+        }
+
+        #disconnectButton {
+            background: #dc2626;
+        }
+
+        #sendButton,
+        #clearButton {
+            background: #2563eb;
+        }
+
+        .status {
+            display: inline-block;
+            padding: 6px 12px;
+            margin-bottom: 16px;
+            border-radius: 999px;
+            background: #4b5563;
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .status.connected {
+            background: #166534;
+            color: #bbf7d0;
+        }
+
+        .status.error {
+            background: #991b1b;
+            color: #fecaca;
+        }
+
+        .log-box {
+            height: 360px;
+            overflow-y: auto;
+            padding: 16px;
+            background: #030712;
+            border: 1px solid #374151;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .log-info {
+            color: #93c5fd;
+        }
+
+        .log-success {
+            color: #86efac;
+        }
+
+        .log-sent {
+            color: #fcd34d;
+        }
+
+        .log-received {
+            color: #c4b5fd;
+        }
+
+        .log-error {
+            color: #fca5a5;
+        }
+
+        .hint {
+            margin-top: 8px;
+            color: #9ca3af;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+<main class="container">
+    <h1>STOMP WebSocket Tester</h1>
+
+    <section class="panel">
+        <div id="status" class="status">Disconnected</div>
+
+        <label for="connectionUrl">Connection URL</label>
+        <input id="connectionUrl" type="text" value="http://localhost:8080/api/v1/ws">
+        <div class="hint">The application currently uses the /api/v1 servlet context path.</div>
+
+        <label for="accessToken">JWT Access Token</label>
+        <input id="accessToken" type="password" placeholder="Paste the access token, with or without Bearer prefix">
+        <div class="hint">Required by the current STOMP authentication interceptor.</div>
+
+        <label for="publishDestination">Publish Destination</label>
+        <input id="publishDestination" type="text" value="/app/chat.send">
+
+        <label for="jsonPayload">JSON Payload</label>
+        <textarea id="jsonPayload">{"from":"browser-client","text":"Hello from STOMP"}</textarea>
+
+        <button id="connectButton">Connect</button>
+        <button id="disconnectButton" disabled>Disconnect</button>
+        <button id="sendButton" disabled>Send Payload</button>
+    </section>
+
+    <section class="panel">
+        <h2>Log Box</h2>
+        <button id="clearButton">Clear Log</button>
+        <div id="logBox" class="log-box"></div>
+    </section>
+</main>
+
+<script>
+    let stompClient = null;
+
+    const statusElement = document.getElementById("status");
+    const logBox = document.getElementById("logBox");
+    const connectButton = document.getElementById("connectButton");
+    const disconnectButton = document.getElementById("disconnectButton");
+    const sendButton = document.getElementById("sendButton");
+    const clearButton = document.getElementById("clearButton");
+    const connectionUrlInput = document.getElementById("connectionUrl");
+    const accessTokenInput = document.getElementById("accessToken");
+    const publishDestinationInput = document.getElementById("publishDestination");
+    const jsonPayloadInput = document.getElementById("jsonPayload");
+
+    function timestamp() {
+        return new Date().toLocaleTimeString();
+    }
+
+    function log(message, type = "info") {
+        const line = document.createElement("div");
+        line.className = `log-${type}`;
+        line.textContent = `[${timestamp()}] ${message}`;
+        logBox.appendChild(line);
+        logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function setStatus(text, type = "") {
+        statusElement.textContent = text;
+        statusElement.className = `status ${type}`;
+    }
+
+    function normalizedAuthorizationHeader() {
+        const token = accessTokenInput.value.trim();
+        if (!token) {
+            return "";
+        }
+        return token.startsWith("Bearer ") ? token : `Bearer ${token}`;
+    }
+
+    function subscribeToTopic(topic) {
+        stompClient.subscribe(topic, (message) => {
+            log(`Received from ${topic}:\n${message.body}`, "received");
+        });
+        log(`Subscribed to ${topic}`, "success");
+    }
+
+    function connect() {
+        const connectionUrl = connectionUrlInput.value.trim();
+        const authorization = normalizedAuthorizationHeader();
+
+        if (!connectionUrl) {
+            log("Connection URL is required.", "error");
+            return;
+        }
+
+        if (!authorization) {
+            log("JWT access token is required by the server.", "error");
+            return;
+        }
+
+        log(`Connecting to ${connectionUrl}...`, "info");
+
+        stompClient = new StompJs.Client({
+            webSocketFactory: () => new SockJS(connectionUrl),
+            connectHeaders: {
+                Authorization: authorization
+            },
+            reconnectDelay: 0,
+            heartbeatIncoming: 10000,
+            heartbeatOutgoing: 10000,
+            debug: () => {
+                // Hide verbose STOMP internal debug output.
+            },
+
+            onConnect: (frame) => {
+                setStatus("Connected", "connected");
+                log(`Connected. Session: ${frame.headers.session || "unknown"}`, "success");
+
+                subscribeToTopic("/user/queue/messages");
+                subscribeToTopic("/topic/messages");
+
+                connectButton.disabled = true;
+                disconnectButton.disabled = false;
+                sendButton.disabled = false;
+            },
+
+            onStompError: (frame) => {
+                setStatus("STOMP Error", "error");
+                log(
+                    `STOMP error: ${frame.headers.message || "Unknown error"}\n${frame.body || ""}`,
+                    "error"
+                );
+            },
+
+            onWebSocketError: (error) => {
+                setStatus("WebSocket Error", "error");
+                log(`WebSocket error: ${error.message || error}`, "error");
+            },
+
+            onWebSocketClose: (event) => {
+                setStatus("Disconnected");
+                log(`WebSocket closed. Code: ${event.code}`, "info");
+
+                connectButton.disabled = false;
+                disconnectButton.disabled = true;
+                sendButton.disabled = true;
+            }
+        });
+
+        stompClient.activate();
+    }
+
+    function disconnect() {
+        if (!stompClient) {
+            return;
+        }
+
+        stompClient.deactivate().then(() => {
+            setStatus("Disconnected");
+            log("Disconnected by client.", "info");
+
+            connectButton.disabled = false;
+            disconnectButton.disabled = true;
+            sendButton.disabled = true;
+            stompClient = null;
+        });
+    }
+
+    function sendPayload() {
+        if (!stompClient || !stompClient.connected) {
+            log("Connect to the server before sending a payload.", "error");
+            return;
+        }
+
+        const destination = publishDestinationInput.value.trim();
+        const payload = jsonPayloadInput.value.trim();
+
+        if (!destination || !payload) {
+            log("Destination and JSON payload are required.", "error");
+            return;
+        }
+
+        try {
+            JSON.parse(payload);
+        } catch (error) {
+            log(`Invalid JSON payload: ${error.message}`, "error");
+            return;
+        }
+
+        stompClient.publish({
+            destination,
+            body: payload
+        });
+
+        log(`Sent to ${destination}:\n${payload}`, "sent");
+    }
+
+    connectButton.addEventListener("click", connect);
+    disconnectButton.addEventListener("click", disconnect);
+    sendButton.addEventListener("click", sendPayload);
+    clearButton.addEventListener("click", () => {
+        logBox.replaceChildren();
+    });
+
+    log("Ready. Enter a JWT access token and click Connect.", "info");
+</script>
+</body>
+</html>

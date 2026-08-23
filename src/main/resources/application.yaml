@@ -3,7 +3,7 @@ spring:
     name: crypto
 
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5433/crypto?TimeZone=Asia/Ho_Chi_Minh}
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/crypto?TimeZone=Asia/Ho_Chi_Minh}
     username: ${DB_USERNAME:postgres}
     password: ${DB_PASSWORD:crypto}
     driver-class-name: org.postgresql.Driver
@@ -59,19 +59,19 @@ server:
 
 app:
   redis:
-    key-prefix: ${REDIS_KEY_PREFIX:crypto:}
+    key-prefix: ${REDIS_KEY_PREFIX}
   auth:
     allowed-origins: ${AUTH_ALLOWED_ORIGINS:http://localhost:5173}
     jwt:
       # Base64 of a 32-byte development key; override in production.
-      secret: ${JWT_SECRET:Y3J5cHRvLXNwcmluZy1qd3Qtc2VjcmV0LWxvY2FsMDE=}
-      issuer: ${JWT_ISSUER:https://crypto-api.local}
+      secret: ${JWT_SECRET}
+      issuer: ${JWT_ISSUER}
       audience: ${JWT_AUDIENCE:crypto-web}
-      access-token-ttl: ${JWT_ACCESS_TOKEN_TTL:PT15M}
-    refresh-token-ttl: ${REFRESH_TOKEN_TTL:P30D}
+      access-token-ttl: ${JWT_ACCESS_TOKEN_TTL}
+    refresh-token-ttl: ${REFRESH_TOKEN_TTL}
     cookie:
-      secure: ${AUTH_COOKIE_SECURE:false}
-      same-site: ${AUTH_COOKIE_SAME_SITE:Lax}
+      secure: ${AUTH_COOKIE_SECURE}
+      same-site: ${AUTH_COOKIE_SAME_SITE}
 
 springdoc:
   api-docs:

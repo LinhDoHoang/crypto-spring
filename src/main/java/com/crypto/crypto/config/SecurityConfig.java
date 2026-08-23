@@ -81,7 +81,10 @@ public class SecurityConfig {
                                 "/last",
                                 "/actuator/health",
                                 "/api-docs/**",
-                                "/swagger-ui/**")
+                                "/swagger-ui/**",
+                                "/stomp-test.html")
+                        .permitAll()
+                        .requestMatchers("/ws/**")
                         .permitAll()
                         .requestMatchers(
                                 "/users/**",
