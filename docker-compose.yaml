@@ -28,8 +28,6 @@ services:
       TZ: Asia/Ho_Chi_Minh
     ports:
       - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - crypto_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -37,3 +35,15 @@ services:
       retries: 10
     restart: unless-stopped
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq_crypto
+    restart: always
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASSWORD=guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+      - "61613:61613"
+    command: sh -c "rabbitmq-plugins enable --offline rabbitmq_stomp && rabbitmq-server"
