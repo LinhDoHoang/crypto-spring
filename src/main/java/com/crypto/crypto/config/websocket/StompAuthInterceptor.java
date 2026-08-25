@@ -36,10 +36,14 @@ public class StompAuthInterceptor implements ChannelInterceptor {
         if (StompCommand.CONNECT.equals(accessor.getCommand())) {
             String auth = accessor.getFirstNativeHeader("Authorization");
             if (auth == null || !auth.startsWith("Bearer ")) {
-                throw new MessagingException("Missing Authorization header on STOMP CONNECT");
+                // Public market data is available without authentication.
+                return message;
             }
 
-            String token = auth.substring(7);
+            String token = auth.substring(7).trim();
+            if (token.isEmpty()) {
+                throw new MessagingException("Bearer token must not be empty");
+            }
             try {
                 Jwt jwt = jwtDecoder.decode(token);
                 String subject = jwt.getSubject();
